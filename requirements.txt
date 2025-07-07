@@ -13,3 +13,4 @@ torch_optimizer
 sox
 soxr
 moduleconf
+audiomentations
