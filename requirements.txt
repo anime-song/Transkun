@@ -1,8 +1,9 @@
 ncls
 pretty_midi
 scipy
-torchaudio
-torch
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.7.0+cu118
+torchaudio==2.7.0+cu118
 mir_eval
 pydub
 seaborn
