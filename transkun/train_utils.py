@@ -215,7 +215,7 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
     if "best_state_dict" in checkpoint:
         best_state_dict = checkpoint["best_state_dict"]
     else:
-        best_state_dict = checkpoint["state_dict"]
+        best_state_dict = None
 
     if "loss_tracker" in checkpoint:
         lossTracker = checkpoint["loss_tracker"]
