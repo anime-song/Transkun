@@ -447,25 +447,37 @@ class DatasetMaestro:
         self.datasetPath = datasetPath
         self.datasetAnnotationPicklePath = datasetAnnotationPicklePath
 
-        t1 = time.time()
-        print("loading the annotation file...")
-        with open(datasetAnnotationPicklePath, "rb") as f:
-            self.data = pickle.load(f)
-        t2 = time.time()
+        self.sample_offsets: list[int] = []
+        self.durations: list[float] = []
 
-        self.durations = [float(_["duration"]) for _ in self.data]
+        # 1 周だけ走査して「オフセット＋duration だけ」収集
+        with open(self.datasetAnnotationPicklePath, "rb") as fp:
+            while True:
+                try:
+                    offset = fp.tell()
+                    sample = pickle.load(fp)  # 1 曲だけロード
+                except EOFError:
+                    break
+
+                self.sample_offsets.append(offset)
+                self.durations.append(float(sample["duration"]))
+                # メモリ節約のため sample は即破棄
+
+        print(
+            f"Found {len(self.sample_offsets)} pieces in {os.path.basename(self.datasetAnnotationPicklePath)}"
+        )
         totalTime = sum(self.durations)
+        print("totalDuration: ", totalTime)
 
-        print("n:", len(self.data), " totalDuration: ", totalTime, " elapsed:", t2 - t1)
-
-        print("creating index for notes in all pieces...")
-
-        t1 = time.time()
-        for e in self.data:
-            e["index"] = createIndexEvents(e["notes"])
-
-        t2 = time.time()
-        print("elapsed:", t2 - t1)
+    def _load_piece(self, idx: int) -> dict:
+        """指定 idx の曲だけをロードして返す。"""
+        with open(self.datasetAnnotationPicklePath, "rb") as fp:
+            fp.seek(self.sample_offsets[idx])
+            piece = pickle.load(fp)
+        # インデックスがまだ無ければ遅延生成
+        if "index" not in piece:
+            piece["index"] = createIndexEvents(piece["notes"])
+        return piece
 
     def __getstate__(self):
         return {
@@ -479,14 +491,11 @@ class DatasetMaestro:
         self.__init__(datasetPath, datasetAnnotationPicklePath)
 
     def getSample(self, idx, normalize=True):
-        # for evaluation
-        e = self.data[idx]
+        piece = self._load_piece(idx)
 
-        notes = e["notes"]
-        audioName = e["audio_filename"]
-
-        audioPath = e["audio_filename"]
-        audioPath = os.path.join(self.datasetPath, audioPath)
+        notes = piece["notes"]
+        audioName = piece["audio_filename"]
+        audioPath = os.path.join(self.datasetPath, audioName)
         from scipy.io import wavfile
 
         fs, result = wavfile.read(audioPath, mmap=False)
@@ -495,39 +504,26 @@ class DatasetMaestro:
             tMax = (np.iinfo(result.dtype)).max
             result = np.divide(result, tMax, dtype=np.float32)
 
-        #  readAudio
-
         return audioName, notes, result, fs
 
-    def getPath(self, idx):
-        # for evaluation
-        e = self.data[idx]
-
-        notes = e["notes"]
-        audioName = e["audio_filename"]
-
-        audioPath = e["audio_filename"]
-        audioPath = os.path.join(self.datasetPath, audioPath)
-        return audioPath
+    def getPath(self, idx: int) -> str:
+        piece = self._load_piece(idx)
+        return os.path.join(self.datasetPath, piece["audio_filename"])
 
     def fetchData(self, idx, begin, end, audioNormalize, notesStrictlyContained):
-        e = self.data[idx]
+        piece = self._load_piece(idx)
 
         # fetch the notes in this interval
         if end < 0 and begin < 0:
             noteIndices = []
         else:
             noteIndices = querySingleInterval(
-                max(begin, 0.0), max(end, 0.0), e["index"]
+                max(begin, 0.0), max(end, 0.0), piece["index"]
             )
 
-        notes = [e["notes"][int(_)] for _ in noteIndices]
-        # print("be",begin,end)
-
-        # for handling notes that goes beyond the current window
+        notes = [piece["notes"][int(_)] for _ in noteIndices]
 
         if notesStrictlyContained:
-            # notes = [_ for _ in notes if _.start>= begin and _.end<end]
             notes = [
                 Note(_.start - begin, _.end - begin, _.pitch, _.velocity)
                 for _ in notes
@@ -535,7 +531,6 @@ class DatasetMaestro:
             ]
 
         else:
-            # trim the notes by the boudnary, notes overlapping between segments will be merged during inference
             notes = [
                 Note(
                     max(_.start, begin) - begin,
@@ -548,20 +543,9 @@ class DatasetMaestro:
                 for _ in notes
             ]
 
-        # for n in notes:
-        # assert(n.start>=0), n
-        # assert(n.end<=end-begin), n
-
-        # fetch the corresponding audio chunk from the file
-
-        audioPath = e["audio_filename"]
-        audioPath = os.path.join(self.datasetPath, audioPath)
-
+        # オーディオ切り出し
+        audioPath = os.path.join(self.datasetPath, piece["audio_filename"])
         audioSlice, fs = readAudioSlice(audioPath, begin, end, audioNormalize)
-
-        # if self.transforms is not None:
-        # for t in self.transforms:
-        # notes, audioSlice = t(notes, audioSlice)
 
         return notes, audioSlice, fs
 
@@ -747,12 +731,10 @@ class AugmentatorAudiomentations:
             AddGaussianSNR,
             Compose,
             PitchShift,
-            AddShortNoises,
             ApplyImpulseResponse,
             AddBackgroundNoise,
             SevenBandParametricEQ,
             PolarityInversion,
-            Reverse,
         )
 
         transformList = [
@@ -780,7 +762,8 @@ class AugmentatorAudiomentations:
             noiseTrans = Compose(
                 [
                     PolarityInversion(),
-                    Reverse(),
+                    PitchShift(),
+                    SevenBandParametricEQ(*eqDBRange, p=0.5),
                 ]
             )
 
@@ -797,7 +780,7 @@ class AugmentatorAudiomentations:
             print("aug: noise enabled")
 
         transformNoiseList.append(
-            AddGaussianSNR(min_snr_db=snrRange[0], max_snr_db=snrRange[1], p=0.5)
+            AddGaussianSNR(min_snr_db=snrRange[0], max_snr_db=snrRange[1], p=0.1)
         )
 
         self.transformNoise = Compose(transformNoiseList)
@@ -843,7 +826,7 @@ class AugmentatorAudiomentations:
 class DatasetMaestroIterator(torch.utils.data.Dataset):
     def __init__(
         self,
-        dataset,
+        dataset: DatasetMaestro,
         hopSizeInSecond,
         chunkSizeInSecond,
         audioNormalize=True,
@@ -864,8 +847,8 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         randGen = random.Random(seed)
 
         chunksAll = []
-        for idx, e in enumerate(self.dataset.data):
-            duration = float(e["duration"])
+        for idx, duration in enumerate(self.dataset.durations):
+            duration = float(duration)
             chunkSizeInSecond = self.chunkSizeInSecond
             hopSizeInSecond = self.hopSizeInSecond
 

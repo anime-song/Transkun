@@ -45,10 +45,13 @@ if __name__ == "__main__":
         os.mkdir(outputPath)
 
     with open(os.path.join(outputPath, "train.pickle"), "wb") as f:
-        pickle.dump(train, f, pickle.HIGHEST_PROTOCOL)
+        for sample in train:
+            pickle.dump(sample, f, pickle.HIGHEST_PROTOCOL)
 
     with open(os.path.join(outputPath, "val.pickle"), "wb") as f:
-        pickle.dump(val, f, pickle.HIGHEST_PROTOCOL)
+        for sample in val:
+            pickle.dump(sample, f, pickle.HIGHEST_PROTOCOL)
 
     with open(os.path.join(outputPath, "test.pickle"), "wb") as f:
-        pickle.dump(test, f, pickle.HIGHEST_PROTOCOL)
+        for sample in test:
+            pickle.dump(sample, f, pickle.HIGHEST_PROTOCOL)
