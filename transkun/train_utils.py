@@ -147,7 +147,7 @@ def initializeCheckpoint(Model, device, max_lr, weight_decay, nIter, conf):
     )
 
     lossTracker = {"train": [], "val": []}
-    best_state_dict = copy.deepcopy(model.state_dict())
+    best_state_dict = None
     startEpoch = 0
     startIter = 0
 
@@ -169,6 +169,7 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
     startIter = checkpoint.get("nIter", 0)
 
     model = Model(conf=conf).to(device)
+    model = torch.compile(model, mode="max-autotune")
 
     optimizerGroup = getOptimizerGroup(model)
 
