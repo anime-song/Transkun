@@ -14,6 +14,7 @@ import torch
 import random
 from collections import defaultdict, deque
 import csv
+from pathlib import Path
 
 
 # a local definition of the midi note object
@@ -374,7 +375,8 @@ def readAudioSlice(audioPath, begin, end, normalize=True):
     from scipy.io import wavfile
     import scipy.io
 
-    fs, data = wavfile.read(audioPath, mmap=True)
+    normalized = audioPath.replace("\\", os.sep)
+    fs, data = wavfile.read(str(Path(normalized).expanduser().resolve()), mmap=True)
 
     b = math.floor((begin) * fs)
     e = math.floor(end * fs)
