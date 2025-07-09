@@ -2,6 +2,7 @@ import os
 import random
 
 from torch.utils.tensorboard import SummaryWriter
+import torch
 
 from . import Data
 import copy
@@ -117,7 +118,11 @@ def train(workerId, filename, runSeed, args):
     augmentator = None
     if args.augment:
         augmentator = Data.AugmentatorAudiomentations(
-            sampleRate=44100, noiseFolder=args.noiseFolder, convIRFolder=args.irFolder
+            sampleRate=44100,
+            noiseFolder=args.noiseFolder,
+            convIRFolder=args.irFolder,
+            eqDBRange=(-6, 6),
+            snrRange=(0, 24),
         )
 
     for epoc in range(startEpoch, 1000000):
@@ -202,11 +207,6 @@ def train(workerId, filename, runSeed, args):
             totalSEVelocity = totalSEVelocity + stats["seVelocityForced"]
             totalSEOF = totalSEOF + stats["seOFForced"]
 
-            # checkNoneGradient(model)
-            # compute gradient clipping value
-
-            # communicate gradient clipping values
-
             loss = totalLoss / totalLen
 
             # adaptive gradient clipping
@@ -217,7 +217,6 @@ def train(workerId, filename, runSeed, args):
             gradNormHist.step(totalNorm.item())
 
             optimizer.step()
-            # curLRScheduler.step()
 
             try:
                 if globalStep > globalStepWarmupCutoff:
@@ -232,7 +231,7 @@ def train(workerId, filename, runSeed, args):
                     "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
                         epoc,
                         idx / len(dataloader),
-                        0,
+                        globalStep,
                         loss.item(),
                         totalNorm.item(),
                         curClipValue,
