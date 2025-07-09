@@ -9,6 +9,7 @@ from .Util import computeParamSize
 
 def readAudio(path, normalize=True):
     import pydub
+
     audio = pydub.AudioSegment.from_mp3(path)
     y = np.array(audio.get_array_of_samples())
     y = y.reshape(-1, audio.channels)
@@ -24,6 +25,32 @@ def main():
     defaultConf = pkg_resources.resource_filename(__name__, "pretrained/2.0.conf")
 
     argumentParser = argparse.ArgumentParser()
+    argumentParser.add_argument("audioPath", help="path to the input audio file")
+    argumentParser.add_argument("outPath", help="path to the output MIDI file")
+    argumentParser.add_argument(
+        "--weight", default=defaultWeight, help="path to the pretrained weight"
+    )
+    argumentParser.add_argument(
+        "--conf", default=defaultConf, help="path to the model conf"
+    )
+    argumentParser.add_argument(
+        "--device",
+        default="cpu",
+        nargs="?",
+        help=" The device used to perform the most computations (optional), DEFAULT: cpu",
+    )
+    argumentParser.add_argument(
+        "--segmentHopSize",
+        type=float,
+        required=False,
+        help=" The segment hopsize for processing the entire audio file (s), DEFAULT: the value defined in model conf",
+    )
+    argumentParser.add_argument(
+        "--segmentSize",
+        type=float,
+        required=False,
+        help=" The segment size for processing the entire audio file (s), DEFAULT: the value defined in model conf",
+    )
 
     args = argumentParser.parse_args()
 
