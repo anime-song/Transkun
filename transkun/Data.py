@@ -1,20 +1,17 @@
 import math
 import copy
-import glob
 import numpy as np
 from pathlib import Path
-import time
 import os
 import wave
 
-import json
 import pretty_midi
 import pickle
 import torch
 import random
-from collections import defaultdict, deque
+from collections import defaultdict
 import csv
-from pathlib import Path
+from typing import Tuple
 
 
 # a local definition of the midi note object
@@ -540,40 +537,64 @@ class AugmentatorAudiomentations:
         return x
 
 
-def mix_at_snr(signal: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarray:
+def mix_at_snr(
+    signal: np.ndarray,
+    noise: np.ndarray,
+    snr_db: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    signal と noise を snr_db[dB] の比率で合成した配列を返す。
-    どちらも shape=(samples, channels) または (samples,) の
-    -1.0〜1.0 float32 前提。
+    signal に noise を指定 SNR[dB] で加算した mixture を返す。
+    戻り値は (mixture, signal_scaled, noise_scaled)。
+
+    前提:
+        - signal, noise: shape=(samples,) または (samples, channels)
+        - 値域: -1.0〜1.0 の float (推奨: float32)
+    動作:
+        - 長さを短い方に揃える
+        - signal 側はスケールしない（基準）
+        - noise 側を snr_db に合うようスケール
+        - 合成後 [-1, 1] にクリップ
+        - 入力が 1D モノラルなら 1D で返す
     """
-    # --- 次元合わせ ---------------------------------------------------
+    # モノラル判定（両方1Dならモノラル扱い）
+    mono_input = (signal.ndim == 1) and (noise.ndim == 1)
+
+    # 2D化 (T, C)
     if signal.ndim == 1:
-        signal = signal[:, np.newaxis]  # → (T, 1)
+        signal = signal[:, np.newaxis]
     if noise.ndim == 1:
         noise = noise[:, np.newaxis]
 
+    # 長さ揃え
     length = min(signal.shape[0], noise.shape[0])
     signal = signal[:length]
     noise = noise[:length]
 
-    # --- パワー計算（平均二乗）---------------------------------------
-    signal_power = np.mean(signal**2)
-    noise_power = np.mean(noise**2)
+    # パワー計算（float64で安全に）
+    signal_power = np.mean(signal.astype(np.float64) ** 2)
+    noise_power = np.mean(noise.astype(np.float64) ** 2)
 
-    if signal_power == 0 or noise_power == 0:
-        # 片方が無音ならそのまま返す
-        return signal
+    # スケール
+    if signal_power == 0.0 or noise_power == 0.0:
+        return (
+            signal.astype(np.float32),
+            signal.astype(np.float32),
+            noise.astype(np.float32),
+        )
 
-    # --- ノイズ側のスケール係数 k ------------------------------------
-    # SNR[dB] = 10 * log10(signal_power / (k^2 * noise_power))
-    #  → k = sqrt(signal_power / noise_power / 10^(SNR/10))
-    k = np.sqrt(signal_power / noise_power / (10.0 ** (snr_db / 10.0)))
-    noise_scaled = noise * k
+    scale = np.sqrt(signal_power / noise_power / (10.0 ** (snr_db / 10.0)))
+    signal_scaled = signal.astype(np.float32)
+    noise_scaled = (noise * scale).astype(np.float32)
 
-    # --- 合成 & クリップ --------------------------------------------
-    mixture = signal + noise_scaled
-    mixture = np.clip(mixture, -1.0, 1.0)  # 安全に −1〜1 に収める
-    return mixture.astype(np.float32)
+    # 合成 & クリップ
+    mixture = signal_scaled + noise_scaled
+    mixture = np.clip(mixture, -1.0, 1.0).astype(np.float32)
+
+    # モノラルなら1Dに戻す
+    if mono_input:
+        return mixture[:, 0], signal_scaled[:, 0], noise_scaled[:, 0]
+    else:
+        return mixture, signal_scaled, noise_scaled
 
 
 class DatasetMaestroIterator(torch.utils.data.Dataset):
@@ -638,7 +659,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         idx, begin, end = self.chunksAll[idx]
         # print(begin, end)
-        notes, audioSlice, other_slice, fs = self.dataset.fetchData(
+        notes, target_audio, other_slice, fs = self.dataset.fetchData(
             idx,
             begin,
             end,
@@ -647,16 +668,18 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         )
 
         if self.augmentator is not None:
-            audioSlice = self.augmentator(audioSlice)
+            target_audio = self.augmentator(target_audio)
 
+        mixture = target_audio
         if other_slice is not None:
             random_snr_db = np.random.uniform(-6.0, 6.0)  # −6〜+6 dB
-            target_audio = audioSlice
-            audioSlice = mix_at_snr(audioSlice, other_slice, random_snr_db)
+            mixture, target_audio, other_audio = mix_at_snr(
+                target_audio, other_slice, random_snr_db
+            )
 
         sample = {
             "notes": notes,
-            "audioSlice": audioSlice,
+            "audioSlice": mixture,
             "target_audio": target_audio,
             "fs": fs,
             "begin": begin,
