@@ -4,7 +4,6 @@ import torch_optimizer as optim
 import torch.nn as nn
 import numpy as np
 import copy
-from .LayersTransformer import LearnableSpatialPositionEmbedding
 
 
 class MovingBuffer:
@@ -100,11 +99,7 @@ def getOptimizerGroup(model):
 
     noDecay = []
     for name, module in model.named_modules():
-        if (
-            isinstance(module, nn.GroupNorm)
-            or isinstance(module, nn.LayerNorm)
-            or isinstance(module, LearnableSpatialPositionEmbedding)
-        ):
+        if isinstance(module, nn.GroupNorm) or isinstance(module, nn.LayerNorm):
             noDecay.extend(list(module.parameters()))
         else:
             noDecay.extend([p for n, p in module.named_parameters() if "bias" in n])
@@ -169,7 +164,6 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
     startIter = checkpoint.get("nIter", 0)
 
     model = Model(conf=conf).to(device)
-    model = torch.compile(model, mode="max-autotune")
 
     optimizerGroup = getOptimizerGroup(model)
 
@@ -185,7 +179,7 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
 
     lrScheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        4e-4,
+        1e-4,
         500000,
         pct_start=0.05,
         cycle_momentum=False,
@@ -223,6 +217,7 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
     else:
         lossTracker = {"train": [], "val": []}
 
+    model = torch.compile(model, mode="max-autotune")
     return (
         startEpoch,
         startIter,
@@ -236,10 +231,10 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
 
 def computeMetrics(model, x, notes):
     with torch.no_grad():
-        logp = model.log_prob(x, notes)
+        logp, _ = model.log_prob(x, notes)
         logp = (logp.sum(-1).mean()).item()
 
-        stats = model.computeStatsMIREVAL(x, notes)
+        stats = model.compute_stats_mireval(x, notes)
 
     length = x.shape[1]
 

@@ -234,53 +234,6 @@ def querySingleInterval(start, end, index):
     return r_loc
 
 
-def createDataset(datasetPath, extendPedal=True):
-    # create dataset
-
-    filenameAll = []
-
-    samplesAll = []
-
-    for path in Path(datasetPath).rglob("*/*.midi"):
-        t1 = time.time()
-        # also find the correspoding audio file
-
-        midiFile = pretty_midi.PrettyMIDI(str(path))
-        assert len(midiFile.instruments) == 1
-
-        inst = midiFile.instruments[0]
-        events = parseEventAll(inst.notes, inst.control_changes, extendPedal)
-
-        t2 = time.time()
-        # also read meta info from the wav file
-
-        relPath = path.relative_to(datasetPath)
-
-        # wavPath = stem.joinpath("wav")
-        wavPath = path.with_suffix(".wav")
-
-        with wave.open(str(wavPath)) as f:
-            fs = f.getframerate()
-            nSamples = f.getnframes()
-            nChannel = f.getnchannels()
-
-        # read meta information about the wav file
-        print(relPath)
-        print("nSamples:{} fs:{} nChannel:{}".format(nSamples, fs, nChannel))
-        # print(events)
-
-        sample = {
-            "relPath": relPath,
-            "nSamples": nSamples,
-            "fs": fs,
-            "nChannel": nChannel,
-            "notes": events,
-        }
-        samplesAll.append(sample)
-
-    return samplesAll
-
-
 def parseMIDIFile(midiPath, extendSustainPedal=False, pedal_ext_offset=0.0):
     # hack for the maps dataset
     pretty_midi.pretty_midi.MAX_TICK = 1e10
@@ -295,43 +248,6 @@ def parseMIDIFile(midiPath, extendSustainPedal=False, pedal_ext_offset=0.0):
         pedal_ext_offset=pedal_ext_offset,
     )
     return events
-
-
-def createDatasetMaestro(datasetPath, datasetMetaJsonPath, extendSustainPedal=True):
-    datasetMetaJsonPath = Path(datasetMetaJsonPath)
-
-    samplesAll = []
-
-    with datasetMetaJsonPath.open() as f:
-        metaInfo = json.load(f)
-        for e in metaInfo:
-            print(e)
-            e = dict(e)
-            midiPath = os.path.join(datasetPath, e["midi_filename"])
-            audioPath = os.path.join(datasetPath, e["audio_filename"])
-
-            midiFile = pretty_midi.PrettyMIDI(midiPath)
-            assert len(midiFile.instruments) == 1
-
-            inst = midiFile.instruments[0]
-            if len(midiFile.instruments) > 1:
-                raise Exception("contains more than one track")
-            events = parseEventAll(
-                inst.notes, inst.control_changes, extendSustainPedal=extendSustainPedal
-            )
-
-            with wave.open(audioPath) as f:
-                fs = f.getframerate()
-                nSamples = f.getnframes()
-                nChannel = f.getnchannels()
-
-            e["notes"] = events
-            e["fs"] = fs
-            e["nSamples"] = nSamples
-            e["nChannel"] = nChannel
-            samplesAll.append(e)
-
-    return samplesAll
 
 
 def createDatasetMaestroCSV(datasetPath, datasetMetaCSVPath, extendSustainPedal=True):
@@ -390,7 +306,7 @@ def readAudioSlice(audioPath, begin, end, normalize=True):
     l = data.shape[0]
 
     if len(data.shape) == 1:
-        data = data[:, np.newaxis]
+        data = np.stack([data, data], axis=-1)
 
     result = data[max(b, 0) : min(e, l), :]
 
@@ -492,26 +408,6 @@ class DatasetMaestro:
         datasetAnnotationPicklePath = d["datasetAnnotationPicklePath"]
         self.__init__(datasetPath, datasetAnnotationPicklePath)
 
-    def getSample(self, idx, normalize=True):
-        piece = self._load_piece(idx)
-
-        notes = piece["notes"]
-        audioName = piece["audio_filename"]
-        audioPath = os.path.join(self.datasetPath, audioName)
-        from scipy.io import wavfile
-
-        fs, result = wavfile.read(audioPath, mmap=False)
-
-        if normalize:
-            tMax = (np.iinfo(result.dtype)).max
-            result = np.divide(result, tMax, dtype=np.float32)
-
-        return audioName, notes, result, fs
-
-    def getPath(self, idx: int) -> str:
-        piece = self._load_piece(idx)
-        return os.path.join(self.datasetPath, piece["audio_filename"])
-
     def fetchData(self, idx, begin, end, audioNormalize, notesStrictlyContained):
         piece = self._load_piece(idx)
 
@@ -549,174 +445,10 @@ class DatasetMaestro:
         audioPath = os.path.join(self.datasetPath, piece["audio_filename"])
         audioSlice, fs = readAudioSlice(audioPath, begin, end, audioNormalize)
 
-        return notes, audioSlice, fs
+        other_path = os.path.join(self.datasetPath, piece["other_filename"])
+        other_slice, fs = readAudioSlice(other_path, begin, end, audioNormalize)
 
-    def sampleSlice(
-        self, durationInSecond, audioNormalize=True, notesStrictlyContained=True
-    ):
-        # the last argument indicate whether or not to include notes that is not entirely inside the region
-
-        # sample an entry  from the dataset
-        idx = random.choices(list(range(len(self.durations))), self.durations)[0]
-        dur = self.durations[idx]
-
-        # then sample a specific chunk inside that audio
-        if dur < durationInSecond:
-            begin = 0
-            end = dur
-        else:
-            begin = random.random() * (dur - durationInSecond)
-            end = begin + durationInSecond
-
-        notes, audioSlice = self.fetchData(
-            idx, begin, end, audioNormalize, notesStrictlyContained
-        )
-
-        return notes, audioSlice, fs
-
-
-def sampleFromRange(valRange, log=False, triangular=False):
-    l, r = valRange
-
-    sampler = random.uniform
-
-    if triangular:
-        sampler = random.triangular
-
-    if not log:
-        v = sampler(l, r)
-    else:
-        l = math.log(l)
-        r = math.log(r)
-        v = sampler(l, r)
-        v = math.exp(v)
-
-    return v
-
-
-class AugmentatorPitchShiftOnly:
-    def __init__(self, sampleRate, pitchShiftRange=(-0.30, 0.30), byPassProb=0.1):
-        self.sampleRate = sampleRate
-        self.pitchShiftRange = pitchShiftRange
-        self.byPassProb = byPassProb
-
-    def __call__(self, x):
-        if random.random() < self.byPassProb:
-            return x
-        nSample = x.shape[0]
-        import sox
-
-        tfm = sox.Transformer()
-
-        pitchShift = sampleFromRange(self.pitchShiftRange)
-        tfm.pitch(pitchShift)
-
-        y_out = tfm.build_array(input_array=x, sample_rate_in=self.sampleRate)
-
-        nSampleOut = y_out.shape[0]
-
-        if nSampleOut != nSample:
-            print("size changed!!")
-            if nSampleOut > nSample:
-                y_out = y_out[:nSample, :]
-            else:
-                y_out = np.pad(y_out, ((0, nSample - nSampleOut), (0, 0)), "constant")
-
-        return y_out
-
-
-class Augmentator:
-    def __init__(
-        self,
-        sampleRate,
-        pitchShiftRange=(-0.3, 0.3),
-        reverbRange=(0, 70),
-        reverbRoomScale=(0, 100),
-        reverbPreDelay=(0, 100),
-        freqRange1=(32, 12000),
-        width_q1=(1, 4),
-        gain_db1=(-10, 5),
-        noiseGain=(0, 0.01),
-        contrastRange=(0, 100),
-        gainRange=(0.25, 4),
-        # gainRange = (1, 1),
-        byPassProb=0.1,
-    ):
-        self.sampleRate = sampleRate
-        self.pitchShiftRange = pitchShiftRange
-        self.reverbRange = reverbRange
-        self.reverbRoomScale = reverbRoomScale
-        self.reverbPreDelay = reverbPreDelay
-
-        # eq
-        self.eqFreqRange1 = freqRange1
-        self.eqWidthRange1 = width_q1
-        self.eqGainRange1 = gain_db1
-
-        self.noiseGain = noiseGain
-        self.gainRange = gainRange
-        self.contrastRange = contrastRange
-        self.byPassProb = byPassProb
-
-    def __call__(self, x):
-        if random.random() < self.byPassProb:
-            return x
-        nSample = x.shape[0]
-        import sox
-
-        tfm = sox.Transformer()
-
-        pitchShift = sampleFromRange(self.pitchShiftRange, triangular=True)
-        tfm.pitch(pitchShift)
-
-        reverbAmount = sampleFromRange(self.reverbRange)
-        roomScale = sampleFromRange(self.reverbRoomScale)
-        predelay = sampleFromRange(self.reverbPreDelay)
-        if reverbAmount > 0:
-            if random.random() > self.byPassProb:
-                # print("reverb")
-                tfm.reverb(reverbAmount, room_scale=roomScale, pre_delay=predelay)
-
-        for i in range(4):
-            eq1Freq = sampleFromRange(self.eqFreqRange1, log=True)
-            q1 = sampleFromRange(self.eqWidthRange1)
-            gain1 = sampleFromRange(self.eqGainRange1)
-
-            if random.random() > self.byPassProb:
-                # print("eq")
-                tfm.equalizer(eq1Freq, q1, gain1)
-
-        if random.random() > self.byPassProb:
-            # print("compression")
-            tfm.contrast(sampleFromRange(self.contrastRange))
-
-        y_out = tfm.build_array(input_array=x, sample_rate_in=self.sampleRate)
-
-        noiseGain = sampleFromRange(self.noiseGain)
-        gain = sampleFromRange(self.gainRange, log=True)
-
-        if random.random() < self.byPassProb:
-            # print("no noise")
-            noiseGain = 0
-
-        noise = np.random.normal(0.0, 1.0, y_out.shape).astype(np.float32)
-
-        y_out = y_out + noiseGain * noise
-        y_out = y_out * gain
-
-        if random.random() > self.byPassProb:
-            y_out = np.clip(y_out, -1, 1)
-
-        nSampleOut = y_out.shape[0]
-
-        if nSampleOut != nSample:
-            print("size changed by sox!!")
-            if nSampleOut > nSample:
-                y_out = y_out[:nSample, :]
-            else:
-                y_out = np.pad(y_out, ((0, nSample - nSampleOut), (0, 0)), "constant")
-
-        return y_out
+        return notes, audioSlice, other_slice, fs
 
 
 class AugmentatorAudiomentations:
@@ -725,7 +457,7 @@ class AugmentatorAudiomentations:
         sampleRate=44100,
         pitchShiftRange=(-0.2, 0.2),
         eqDBRange=(-3, 3),
-        snrRange=(3, 40),
+        snrRange=(0, 40),
         convIRFolder=None,
         noiseFolder=None,
     ):
@@ -773,7 +505,7 @@ class AugmentatorAudiomentations:
                 AddBackgroundNoise(
                     fileList,
                     *snrRange,
-                    p=0.5,
+                    p=0.7,
                     lru_cache_size=256,
                     noise_transform=noiseTrans,
                 )
@@ -792,19 +524,6 @@ class AugmentatorAudiomentations:
         x = copy.deepcopy(x)
         x = x.T
 
-        # randomly downmix channels
-        if len(x.shape) == 2:
-            nChannel = x.shape[0]
-
-            weight = 2 * np.random.rand(1, nChannel) - 1
-            weight = (weight + 1e-8) / (np.sum(np.abs(weight)) + 1e-8)
-
-            x = np.matmul(weight, x)
-            x = x.astype(np.float32)
-
-        # x = x[:]
-        x = x.squeeze(0)
-
         x = self.transform(x, sample_rate=self.sampleRate)
 
         # apply transform before impulse response
@@ -817,12 +536,44 @@ class AugmentatorAudiomentations:
             x = alpha * x + (1 - alpha) * xReverb
 
         x = self.transformNoise(x, sample_rate=self.sampleRate)
-
-        x = x[None, :]
-
         x = x.T
-
         return x
+
+
+def mix_at_snr(signal: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarray:
+    """
+    signal と noise を snr_db[dB] の比率で合成した配列を返す。
+    どちらも shape=(samples, channels) または (samples,) の
+    -1.0〜1.0 float32 前提。
+    """
+    # --- 次元合わせ ---------------------------------------------------
+    if signal.ndim == 1:
+        signal = signal[:, np.newaxis]  # → (T, 1)
+    if noise.ndim == 1:
+        noise = noise[:, np.newaxis]
+
+    length = min(signal.shape[0], noise.shape[0])
+    signal = signal[:length]
+    noise = noise[:length]
+
+    # --- パワー計算（平均二乗）---------------------------------------
+    signal_power = np.mean(signal**2)
+    noise_power = np.mean(noise**2)
+
+    if signal_power == 0 or noise_power == 0:
+        # 片方が無音ならそのまま返す
+        return signal
+
+    # --- ノイズ側のスケール係数 k ------------------------------------
+    # SNR[dB] = 10 * log10(signal_power / (k^2 * noise_power))
+    #  → k = sqrt(signal_power / noise_power / 10^(SNR/10))
+    k = np.sqrt(signal_power / noise_power / (10.0 ** (snr_db / 10.0)))
+    noise_scaled = noise * k
+
+    # --- 合成 & クリップ --------------------------------------------
+    mixture = signal + noise_scaled
+    mixture = np.clip(mixture, -1.0, 1.0)  # 安全に −1〜1 に収める
+    return mixture.astype(np.float32)
 
 
 class DatasetMaestroIterator(torch.utils.data.Dataset):
@@ -887,7 +638,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         idx, begin, end = self.chunksAll[idx]
         # print(begin, end)
-        notes, audioSlice, fs = self.dataset.fetchData(
+        notes, audioSlice, other_slice, fs = self.dataset.fetchData(
             idx,
             begin,
             end,
@@ -895,13 +646,21 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
             notesStrictlyContained=self.notesStrictlyContained,
         )
 
-        # shift all positions of notes to the begining
-        # print(notes[0])
-        # print(notes[-1])
         if self.augmentator is not None:
             audioSlice = self.augmentator(audioSlice)
 
-        sample = {"notes": notes, "audioSlice": audioSlice, "fs": fs, "begin": begin}
+        if other_slice is not None:
+            random_snr_db = np.random.uniform(-6.0, 6.0)  # −6〜+6 dB
+            target_audio = audioSlice
+            audioSlice = mix_at_snr(audioSlice, other_slice, random_snr_db)
+
+        sample = {
+            "notes": notes,
+            "audioSlice": audioSlice,
+            "target_audio": target_audio,
+            "fs": fs,
+            "begin": begin,
+        }
 
         return sample
 
@@ -913,6 +672,7 @@ def collate_fn(batch):
 def collate_fn_batching(batch):
     notesBatch = [sample["notes"] for sample in batch]
     audioSlices = [torch.from_numpy(sample["audioSlice"]) for sample in batch]
+    target_audios = [torch.from_numpy(sample["target_audio"]) for sample in batch]
 
     nAudioSamplesMin = min([_.shape[0] for _ in audioSlices])
     nAudioSamplesMax = max([_.shape[0] for _ in audioSlices])
@@ -920,10 +680,16 @@ def collate_fn_batching(batch):
     assert nAudioSamplesMax - nAudioSamplesMin < 2
 
     audioSlices = [_[:nAudioSamplesMin] for _ in audioSlices]
+    target_audios = [_[:nAudioSamplesMin] for _ in target_audios]
 
     audioSlices = torch.stack(audioSlices, dim=0)
+    target_audios = torch.stack(target_audios, dim=0)
 
-    return {"notes": notesBatch, "audioSlices": audioSlices}
+    return {
+        "notes": notesBatch,
+        "audioSlices": audioSlices,
+        "target_audio": target_audios,
+    }
 
 
 def collate_fn_randmized_len(batch):

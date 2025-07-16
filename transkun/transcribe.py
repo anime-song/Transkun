@@ -4,7 +4,10 @@ from .Data import writeMidi
 import torch
 import moduleconf
 import numpy as np
-from .Util import computeParamSize
+import soundfile as sf
+from pathlib import Path
+from .utils import computeParamSize
+from .model import TransKun
 
 
 def readAudio(path, normalize=True):
@@ -51,6 +54,12 @@ def main():
         required=False,
         help=" The segment size for processing the entire audio file (s), DEFAULT: the value defined in model conf",
     )
+    argumentParser.add_argument(
+        "--outWav",
+        default=None,
+        help=" path to the separated‑piano WAV file (optional). "
+        "省略時は <audioPath の親フォルダ>/<stem>_piano.wav",
+    )
 
     args = argumentParser.parse_args()
 
@@ -61,20 +70,15 @@ def main():
     confPath = args.conf
 
     confManager = moduleconf.parseFromFile(confPath)
-    TransKun = confManager["Model"].module.TransKun
+    transkun: TransKun = confManager["Model"].module.TransKun
     conf = confManager["Model"].config
 
     checkpoint = torch.load(path, map_location=device)
 
-    # conf = TransKun.Config()
-    # conf.__dict__ = checkpoint['conf']
-
-    model = TransKun(conf=conf).to(device)
+    model: TransKun = transkun(conf=conf).to(device)
     model = torch.compile(model, mode="max-autotune")
-    # print("#Param(M):", computeParamSize(model))
 
-
-    if not "best_state_dict" in checkpoint:
+    if "best_state_dict" not in checkpoint or checkpoint["best_state_dict"] is None:
         model.load_state_dict(checkpoint["state_dict"], strict=False)
     else:
         model.load_state_dict(checkpoint["best_state_dict"], strict=False)
@@ -83,6 +87,13 @@ def main():
 
     audioPath = args.audioPath
     outPath = args.outPath
+    if args.outWav is not None:
+        write_wav_path = Path(args.outWav)
+    else:
+        audio_path_obj = Path(audioPath)
+        write_wav_path = audio_path_obj.with_name(
+            f"{audio_path_obj.stem}_separated.wav"
+        )
     torch.set_grad_enabled(False)
 
     fs, audio = readAudio(audioPath)
@@ -98,7 +109,7 @@ def main():
 
     x = torch.from_numpy(audio).to(device)
 
-    notesEst = model.transcribe(
+    notesEst, recon_audio = model.transcribe(
         x,
         stepInSecond=args.segmentHopSize,
         segmentSizeInSecond=args.segmentSize,
@@ -107,6 +118,9 @@ def main():
 
     outputMidi = writeMidi(notesEst)
     outputMidi.write(outPath)
+
+    recon_np = recon_audio.transpose(0, 1).cpu().numpy()  # (T, C)
+    sf.write(write_wav_path, recon_np, conf.fs, subtype="PCM_16")
 
 
 if __name__ == "__main__":

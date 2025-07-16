@@ -102,6 +102,7 @@ def train(workerId, filename, runSeed, args):
 
     # this iterator should be constructed each time
     batchSize = args.batchSize
+    loss_spec_weight = conf.loss_spec_weight
 
     if args.hopSize is None:
         hopSize = conf.segmentHopSizeInSecond
@@ -118,11 +119,7 @@ def train(workerId, filename, runSeed, args):
     augmentator = None
     if args.augment:
         augmentator = Data.AugmentatorAudiomentations(
-            sampleRate=44100,
-            noiseFolder=args.noiseFolder,
-            convIRFolder=args.irFolder,
-            eqDBRange=(-6, 6),
-            snrRange=(0, 24),
+            sampleRate=44100, noiseFolder=args.noiseFolder, convIRFolder=args.irFolder
         )
 
     for epoc in range(startEpoch, 1000000):
@@ -180,11 +177,15 @@ def train(workerId, filename, runSeed, args):
 
             notesBatch = batch["notes"]
             audioSlices = batch["audioSlices"].to(device)
-
+            target_audio = batch["target_audio"].to(device)
             audioLength = audioSlices.shape[1] / model.conf.fs
 
-            logp = model.log_prob(audioSlices, notesBatch)
-            loss = -logp.sum(-1).mean()
+            logp, loss_spec = model.log_prob(
+                audioSlices, notesBatch, target_audio=target_audio
+            )
+            loss_spec = loss_spec * loss_spec_weight
+            loss_seq = -logp.sum(-1).mean()
+            loss = loss_seq + loss_spec
 
             (loss / 50).backward()
 
@@ -195,8 +196,8 @@ def train(workerId, filename, runSeed, args):
             if computeStats:
                 with torch.no_grad():
                     model.eval()
-                    stats = model.computeStats(audioSlices, notesBatch)
-                    stats2 = model.computeStatsMIREVAL(audioSlices, notesBatch)
+                    stats = model.compute_stats(audioSlices, notesBatch)
+                    stats2 = model.compute_stats_mireval(audioSlices, notesBatch)
 
             totalGT = totalGT + stats2["nGT"]
             totalEst = totalEst + stats2["nEst"]
@@ -228,11 +229,12 @@ def train(workerId, filename, runSeed, args):
             if workerId == 0:
                 t2 = time.time()
                 print(
-                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
+                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} loss_spec:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
                         epoc,
                         idx / len(dataloader),
                         globalStep,
                         loss.item(),
+                        loss_spec.item(),
                         totalNorm.item(),
                         curClipValue,
                         t2 - t1,
@@ -241,6 +243,7 @@ def train(workerId, filename, runSeed, args):
                 writer.add_scalar(f"Loss/train", loss.item(), globalStep)
                 writer.add_scalar(f"Optimizer/gradNorm", totalNorm.item(), globalStep)
                 writer.add_scalar(f"Optimizer/clipValue", curClipValue, globalStep)
+                writer.add_scalar(f"LossSpec/train", loss_spec.item(), globalStep)
                 if computeStats:
                     nGT = totalGT.item() + 1e-4
                     nEst = totalEst.item() + 1e-4
@@ -378,9 +381,9 @@ if __name__ == "__main__":
     parser.add_argument("--dataLoaderWorkers", default=2, type=int)
     parser.add_argument("--gradClippingQuantile", default=0.8, type=float)
 
-    parser.add_argument("--max_lr", default=2e-4, type=float)
+    parser.add_argument("--max_lr", default=5e-4, type=float)
     parser.add_argument("--weight_decay", default=1e-4, type=float)
-    parser.add_argument("--nIter", default=180000, type=int)
+    parser.add_argument("--nIter", default=500000, type=int)
     parser.add_argument(
         "--modelConf", required=True, help="the path to the model conf file"
     )

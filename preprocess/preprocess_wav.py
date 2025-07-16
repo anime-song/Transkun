@@ -9,8 +9,20 @@ import librosa
 import soundfile as sf
 
 
-def convert_to_mono_wav(src_path: Path, dst_path: Path, target_sr: int) -> None:
-    audio, _ = librosa.load(str(src_path), sr=target_sr, mono=True)
+def convert_to_wav(src_path: Path, dst_path: Path, target_sr: int) -> None:
+    """src_path を読み込み、指定 SR で WAV 保存する。
+    モノラル入力の場合はチャンネルを複製してステレオ化する。
+    """
+    # mono=False で多チャンネルをそのまま取得
+    audio, _ = librosa.load(str(src_path), sr=target_sr, mono=False)
+
+    # audio.shape: (channels, samples) もしくは (samples,) ←モノラル
+    if audio.ndim == 1:  # モノラル → (2, samples) に複製
+        audio = np.stack([audio, audio], axis=0)
+
+    # (channels, samples) → (samples, channels) に転置（soundfile 期待形状）
+    audio = audio.T
+
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(dst_path), audio, target_sr)
 
@@ -20,18 +32,18 @@ def process_file(path: Path, target_sr: int, overwrite_wav: bool) -> str:
     try:
         if ext == ".wav":
             if overwrite_wav:
-                convert_to_mono_wav(path, path, target_sr)
+                convert_to_wav(path, path, target_sr)
                 return f"Updated WAV → {path}"
             else:
                 converted = path.with_name(path.stem + "_converted.wav")
-                convert_to_mono_wav(path, converted, target_sr)
+                convert_to_wav(path, converted, target_sr)
                 return f"Created copy → {converted}"
 
         if ext == ".mp3":
             wav_dst = path.with_suffix(".wav")
             if wav_dst.exists() and not overwrite_wav:
                 wav_dst = path.with_name(path.stem + "_from_mp3.wav")
-            convert_to_mono_wav(path, wav_dst, target_sr)
+            convert_to_wav(path, wav_dst, target_sr)
             return f"MP3 converted → {wav_dst}"
 
         return f"Skipped (unsupported) → {path}"
