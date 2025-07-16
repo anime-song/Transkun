@@ -227,9 +227,7 @@ class TransKun(torch.nn.Module):
         if target_audio is not None:
             target_audio = target_audio.transpose(-1, -2)
 
-        crfBatch, ctxBatch, recon_audio = self.process_frames_batch(
-            inputs, target_audio=target_audio
-        )
+        crfBatch, ctxBatch, recon_audio = self.process_frames_batch(inputs)
 
         loss_spec = 0.0
         if target_audio is not None:
@@ -241,7 +239,11 @@ class TransKun(torch.nn.Module):
                 sample_rate=self.fs,
                 return_as_loss=True,
             )
-            loss_spec += log_wmse(inputs, recon_audio, target_audio)
+            loss_spec += log_wmse(
+                inputs[:, :, :],
+                recon_audio[:, :, None, :],
+                target_audio[:, :, None, :],
+            )
 
         # prepare groundtruth
         intervalsBatch = []
@@ -340,7 +342,7 @@ class TransKun(torch.nn.Module):
         B = inputs.shape[0]
         inputs = inputs.transpose(-1, -2)
 
-        notesEstBatch, _ = self.transcribeFrames(inputs)
+        notesEstBatch, _, _ = self.transcribeFrames(inputs)
 
         assert len(notes_batch) == len(notesEstBatch)
 
