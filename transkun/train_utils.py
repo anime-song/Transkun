@@ -122,14 +122,7 @@ def initializeCheckpoint(Model, device, max_lr, weight_decay, nIter, conf):
 
     optimizerGroup = getOptimizerGroup(model)
 
-    optimizer = optim.AdaBelief(
-        optimizerGroup,
-        max_lr,
-        weight_decouple=True,
-        eps=1e-8,
-        weight_decay=weight_decay,
-        rectify=True,
-    )
+    optimizer = torch.optim.Adam(optimizerGroup, max_lr)
 
     lrScheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -164,22 +157,15 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
     startIter = checkpoint.get("nIter", 0)
 
     model = Model(conf=conf).to(device)
+    model = torch.compile(model, mode="max-autotune")
 
     optimizerGroup = getOptimizerGroup(model)
 
-    optimizer = optim.AdaBelief(
-        # model.parameters(),
-        optimizerGroup,
-        1e-5,
-        weight_decouple=True,
-        eps=1e-8,
-        weight_decay=1e-2,
-        rectify=True,
-    )
+    optimizer = torch.optim.Adam(optimizerGroup, 1e-4)
 
     lrScheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        1e-4,
+        4e-4,
         500000,
         pct_start=0.05,
         cycle_momentum=False,
@@ -217,7 +203,6 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
     else:
         lossTracker = {"train": [], "val": []}
 
-    model = torch.compile(model, mode="max-autotune")
     return (
         startEpoch,
         startIter,

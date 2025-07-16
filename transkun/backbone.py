@@ -532,6 +532,7 @@ class Backbone(nn.Module):
             input_dim=hidden_size,
             band_indices=self.band_indices,
             num_channels=num_channels,
+            mlp_expansion_factor=1,
         )
 
     def forward(self, x):

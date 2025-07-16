@@ -234,7 +234,7 @@ def train(workerId, filename, runSeed, args):
                         idx / len(dataloader),
                         globalStep,
                         loss.item(),
-                        loss_spec.item(),
+                        loss_spec.item() / loss_spec_weight,
                         totalNorm.item(),
                         curClipValue,
                         t2 - t1,
@@ -243,7 +243,9 @@ def train(workerId, filename, runSeed, args):
                 writer.add_scalar(f"Loss/train", loss.item(), globalStep)
                 writer.add_scalar(f"Optimizer/gradNorm", totalNorm.item(), globalStep)
                 writer.add_scalar(f"Optimizer/clipValue", curClipValue, globalStep)
-                writer.add_scalar(f"LossSpec/train", loss_spec.item(), globalStep)
+                writer.add_scalar(
+                    f"Loss/train_spec", loss_spec.item() / loss_spec_weight, globalStep
+                )
                 if computeStats:
                     nGT = totalGT.item() + 1e-4
                     nEst = totalEst.item() + 1e-4
