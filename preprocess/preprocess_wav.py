@@ -7,6 +7,7 @@ from pathlib import Path
 
 import librosa
 import soundfile as sf
+import numpy as np
 
 
 def convert_to_wav(src_path: Path, dst_path: Path, target_sr: int) -> None:
