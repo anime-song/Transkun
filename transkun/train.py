@@ -3,7 +3,7 @@ import random
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
-
+from .model import TransKun
 from . import Data
 import copy
 import time
@@ -14,6 +14,37 @@ from .train_utils import *
 import argparse
 
 import moduleconf
+
+
+def collect_grad_stats(model, learning_rate: float | None = None, eps: float = 1e-12):
+    stats = []
+    for parameter_name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+
+        grad_data = parameter.grad.detach()
+        param_data = parameter.detach()
+
+        grad_rms = grad_data.pow(2).mean().sqrt().item()
+        param_rms = param_data.pow(2).mean().sqrt().item()
+        grad_l2 = grad_data.norm().item()
+        param_l2 = param_data.norm().item()
+
+        if learning_rate is not None:
+            relative_update = learning_rate * grad_rms / (param_rms + eps)
+        else:
+            relative_update = float("nan")
+
+        stats.append(
+            {
+                "name": parameter_name,
+                "grad_rms": grad_rms,
+                "grad_l2": grad_l2,
+                "param_rms": param_rms,
+                "param_l2": param_l2,
+            }
+        )
+    return stats
 
 
 def train(workerId, filename, runSeed, args):
@@ -35,8 +66,9 @@ def train(workerId, filename, runSeed, args):
 
     # obtain the Model Module
     confManager = moduleconf.parseFromFile(args.modelConf)
-    TransKun = confManager["Model"].module.TransKun
+    transkun_model = confManager["Model"].module.TransKun
     conf = confManager["Model"].config
+    model: TransKun
 
     if workerId == 0:
         # if the saved file does not exist
@@ -52,7 +84,7 @@ def train(workerId, filename, runSeed, args):
                 optimizer,
                 lrScheduler,
             ) = initializeCheckpoint(
-                TransKun,
+                transkun_model,
                 device=device,
                 max_lr=args.max_lr,
                 weight_decay=args.weight_decay,
@@ -79,7 +111,7 @@ def train(workerId, filename, runSeed, args):
         best_state_dict,
         optimizer,
         lrScheduler,
-    ) = load_checkpoint(TransKun, conf, filename, device)
+    ) = load_checkpoint(transkun_model, conf, filename, device)
     print("#{} loaded".format(workerId))
 
     if workerId == 0:
@@ -180,18 +212,21 @@ def train(workerId, filename, runSeed, args):
             target_audio = batch["target_audio"].to(device)
             audioLength = audioSlices.shape[1] / model.conf.fs
 
-            logp, loss_spec = model.log_prob(
+            logp, (loss_wave, loss_wmse) = model.log_prob(
                 audioSlices, notesBatch, target_audio=target_audio
             )
-            loss_spec = loss_spec * loss_spec_weight
+            loss_recon = (loss_wave + loss_wmse) * loss_spec_weight
             loss_seq = -logp.sum(-1).mean()
-            loss = loss_seq + loss_spec
+            loss = loss_seq + loss_recon
 
             (loss / 50).backward()
 
+            # 勾配の確認
+            # print(collect_grad_stats(model))
+
             totalBatch = totalBatch + 1
             totalLen = totalLen + audioLength
-            totalLoss = totalLoss + loss.detach()
+            totalLoss = totalLoss + loss.detach() - loss_recon.detach()
 
             if computeStats:
                 with torch.no_grad():
@@ -229,12 +264,12 @@ def train(workerId, filename, runSeed, args):
             if workerId == 0:
                 t2 = time.time()
                 print(
-                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} loss_spec:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
+                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} log_wmse:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
                         epoc,
                         idx / len(dataloader),
                         globalStep,
                         loss.item(),
-                        loss_spec.item() / loss_spec_weight,
+                        loss_wmse.item(),
                         totalNorm.item(),
                         curClipValue,
                         t2 - t1,
@@ -243,9 +278,7 @@ def train(workerId, filename, runSeed, args):
                 writer.add_scalar(f"Loss/train", loss.item(), globalStep)
                 writer.add_scalar(f"Optimizer/gradNorm", totalNorm.item(), globalStep)
                 writer.add_scalar(f"Optimizer/clipValue", curClipValue, globalStep)
-                writer.add_scalar(
-                    f"Loss/train_spec", loss_spec.item() / loss_spec_weight, globalStep
-                )
+                writer.add_scalar(f"Loss/train_spec", loss_wmse.item(), globalStep)
                 if computeStats:
                     nGT = totalGT.item() + 1e-4
                     nEst = totalEst.item() + 1e-4
@@ -377,7 +410,7 @@ if __name__ == "__main__":
     parser.add_argument("--datasetMetaFile_train", required=True)
     parser.add_argument("--datasetMetaFile_val", required=True)
 
-    parser.add_argument("--batchSize", default=4, type=int)
+    parser.add_argument("--batchSize", default=6, type=int)
     parser.add_argument("--hopSize", required=False, type=float)
     parser.add_argument("--chunkSize", required=False, type=float)
     parser.add_argument("--dataLoaderWorkers", default=2, type=int)

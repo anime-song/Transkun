@@ -118,7 +118,7 @@ class BandSplit(torch.nn.Module):
         self.band_indices = band_indices
 
         for i, idx in enumerate(band_indices):
-            self.register_buffer(f"band_idx_{i}", torch.tensor(idx, dtype=torch.int32))
+            self.register_buffer(f"band_idx_{i}", torch.tensor(idx, dtype=torch.long))
 
         self.num_bands = len(band_indices)
         self.projections = torch.nn.ModuleList([])
@@ -218,20 +218,6 @@ class MaskEstimator(nn.Module):
             out.append(sub_band)
 
         return torch.concat(out, dim=-1)  # (B, T, C, F)
-
-
-class ResBlock(nn.Module):
-    def __init__(self, module, size, prenorm=True, dropoutProb=0.0):
-        super().__init__()
-        self.module = module
-        self.norm = RMSNorm(size)
-
-        # LayerScale
-        self.scale = nn.Parameter(torch.ones(size) * 1e-2)
-        self.dropout = nn.Dropout(dropoutProb)
-
-    def forward(self, x, *args):
-        return x + self.dropout(self.module(self.norm(x), *args)) * self.scale
 
 
 class RotaryEmbeddings(torch.nn.Module):
@@ -376,7 +362,7 @@ class MultiHeadAttentionKernel(nn.Module):
         v = v.unflatten(-1, (self.num_heads, self.head_dim))
         v = v.transpose(-2, -3)
 
-        cos, sin = self.rope(q.shape[2], dtype=q.dtype, device=q.device)
+        cos, sin = self.rope(q.shape[-2], dtype=q.dtype, device=q.device)
         q, k = apply_rotary_embedding(q, k, cos, sin)
 
         with sdpa_kernel(
@@ -388,9 +374,9 @@ class MultiHeadAttentionKernel(nn.Module):
         ):
             with torch.autocast(device_type=q.device.type, dtype=torch.bfloat16):
                 fetched = F.scaled_dot_product_attention(q, k, v)
-                fetched = fetched.float()
 
-        fetched = einops.rearrange(fetched, "b h t d -> b t (h d)")
+        fetched = fetched.float()
+        fetched = einops.rearrange(fetched, "b h t d -> b t (h d)").contiguous()
         result = self.out_proj(fetched)
         return result
 
@@ -405,23 +391,28 @@ class RoformerLayer(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-        self.attention = ResBlock(
-            MultiHeadAttentionKernel(hidden_size, num_heads=num_heads), size=input_size
+        self.attention = MultiHeadAttentionKernel(hidden_size, num_heads=num_heads)
+        self.ffn = nn.Sequential(
+            nn.Linear(input_size, hidden_size * ffn_hidden_size_factor),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * ffn_hidden_size_factor, input_size),
         )
-        self.ffn = ResBlock(
-            nn.Sequential(
-                nn.Linear(input_size, hidden_size * ffn_hidden_size_factor),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_size * ffn_hidden_size_factor, input_size),
-            ),
-            size=input_size,
-        )
+
+        self.norm_before_attn = RMSNorm(input_size)
+        self.norm_before_ffn = RMSNorm(input_size)
 
     def forward(self, x):
         # x: [B, T, F]
+        residual = x
+        x = self.norm_before_attn(x)
         x = self.attention(x)
+        x = x + residual
+
+        residual = x
+        x = self.norm_before_ffn(x)
         x = self.ffn(x)
+        x = x + residual
         return x
 
 
@@ -520,13 +511,16 @@ class Backbone(nn.Module):
         self.register_buffer(
             "freq_indices",
             torch.tensor(np.concatenate(self.band_indices), dtype=torch.long),
+            persistent=False,
         )
         # そのビンが何本のバンドに含まれるかを数える
         counts = np.zeros(n_fft // 2 + 1, dtype=np.float32)
         for idx in self.band_indices:
             counts[idx] += 1
         self.register_buffer(
-            "num_bands_per_freq", torch.tensor(counts, dtype=torch.float32)
+            "num_bands_per_freq",
+            torch.tensor(counts, dtype=torch.float32),
+            persistent=False,
         )  # shape (F_total,)
         self.mask_estimator = MaskEstimator(
             input_dim=hidden_size,
@@ -542,18 +536,11 @@ class Backbone(nn.Module):
         else:
             checkpoint = checkpointByPass
 
-        def _band_split_forward(inp, *params):
-            # params は forward 内で使わなくても OK
-            # （Python の参照が残ることで autograd が追跡できる）
-            return self.band_split(inp)
-
         x = einops.rearrange(x, "b c t f -> b t c f")
 
         # 勾配が流れない問題に対処
         x = checkpoint(
-            _band_split_forward,
-            x,
-            *self.band_split.parameters(),
+            self.band_split, x, use_reentrant=False
         )  # (B, T, K, hidden_size)
 
         # バンド軸にピッチクエリを追加
@@ -563,13 +550,17 @@ class Backbone(nn.Module):
         pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, T, E, D]
         x = torch.cat([x, pitch_query], dim=2)  # [B, T, K+E, D]
 
+        x = F.pad(x, (0, 0, 1, 0, 1, 0))
+
         for layer in self.encoder_layers:
-            x = checkpoint(layer, x)
+            x = checkpoint(layer, x, use_reentrant=False)
         # x: [B, T, K+E, D]
+
+        x = x[:, 1:, 1:, :]
 
         # 音源分離マスク
         mask_x = checkpoint(
-            self.mask_estimator, x[:, :, : self.num_bands]
+            self.mask_estimator, x[:, :, : self.num_bands], use_reentrant=False
         )  # [B, T, C*S, F]
         mask_x = einops.rearrange(mask_x, "b t (c s) f -> b t c f s", s=2).contiguous()
         mask_x = torch.view_as_complex(mask_x)  # [B, T, C, F]

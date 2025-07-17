@@ -23,9 +23,9 @@ class ModelConfig:
         self.fs = 44100
         self.num_bands = 60
         self.num_channels = 2
-        self.loss_spec_weight = 30.0
+        self.loss_spec_weight = 1.0
 
-        self.baseSize = 40
+        self.baseSize = 64
         self.nHead = 4
 
         self.nLayers = 6
@@ -180,10 +180,17 @@ class TransKun(torch.nn.Module):
             spectrogram, "(b c) f t -> b c f t", c=self.num_channels
         )
         spectrogram_complex = spectrogram  # [B, C, F, T]
-        spectrogram = torch.view_as_real(spectrogram)
-        spectrogram = einops.rearrange(spectrogram, "b c f t s -> b (c s) t f", s=2)
 
-        ctx, mask = self.backbone(spectrogram)
+        # ノーマライズ
+        spectrogram = torch.view_as_real(spectrogram)
+        mean = torch.mean(spectrogram, dim=[1, 2, 3], keepdim=True)
+        std = torch.std(spectrogram, dim=[1, 2, 3], keepdim=True)
+        norm_spectrogram = (spectrogram - mean) / (std + 1e-8)
+        norm_spectrogram = einops.rearrange(
+            norm_spectrogram, "b c f t s -> b (c s) t f", s=2
+        )
+
+        ctx, mask = self.backbone(norm_spectrogram)
 
         separated_spectrogram = spectrogram_complex * mask
         separated_spectrogram = einops.rearrange(
@@ -229,17 +236,18 @@ class TransKun(torch.nn.Module):
 
         crfBatch, ctxBatch, recon_audio = self.process_frames_batch(inputs)
 
-        loss_spec = 0.0
+        loss_wave = 0.0
+        loss_wmse = 0.0
         if target_audio is not None:
             target_audio = target_audio[..., : recon_audio.shape[-1]]
 
-            loss_spec = F.l1_loss(recon_audio, target_audio)
+            loss_wave = F.l1_loss(recon_audio, target_audio)
             log_wmse = LogWMSE(
                 audio_length=recon_audio.shape[-1] / self.fs,
                 sample_rate=self.fs,
                 return_as_loss=True,
             )
-            loss_spec += log_wmse(
+            loss_wmse = log_wmse(
                 inputs[:, :, :],
                 recon_audio[:, :, None, :],
                 target_audio[:, :, None, :],
@@ -336,7 +344,7 @@ class TransKun(torch.nn.Module):
 
         logProb = logProb.view(B, -1)
 
-        return logProb, loss_spec
+        return logProb, (loss_wave, loss_wmse)
 
     def compute_stats_mireval(self, inputs, notes_batch):
         B = inputs.shape[0]
