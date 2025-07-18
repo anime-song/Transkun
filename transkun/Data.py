@@ -672,10 +672,11 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         mixture = target_audio
         if other_slice is not None:
-            random_snr_db = np.random.uniform(-6.0, 6.0)  # −6〜+6 dB
+            random_snr_db = np.random.uniform(-6.0, 6.0)
             mixture, target_audio, other_audio = mix_at_snr(
                 target_audio, other_slice, random_snr_db
             )
+            target_audio = np.stack([target_audio, other_audio], axis=-2)  # [T, N, C]
 
         sample = {
             "notes": notes,

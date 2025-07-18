@@ -19,14 +19,15 @@ class ModelConfig:
         self.segmentSizeInSecond = 16
 
         self.hopSize = 1024
-        self.windowSize = 4096
+        self.windowSize = 2048
         self.fs = 44100
         self.num_bands = 60
         self.num_channels = 2
         self.loss_spec_weight = 1.0
 
         self.baseSize = 64
-        self.nHead = 4
+        self.nHead = 8
+        self.band_split_type = "bs"
 
         self.nLayers = 6
         self.hiddenFactor = 4
@@ -108,6 +109,7 @@ class TransKun(torch.nn.Module):
         self.fs = conf.fs
         self.num_channels = conf.num_channels
         self.n_fft = self.window_size
+        self.num_stems = 2
 
         self.segmentSizeInSecond = conf.segmentSizeInSecond
         self.segmentHopSizeInSecond = conf.segmentHopSizeInSecond
@@ -144,15 +146,16 @@ class TransKun(torch.nn.Module):
         self.backbone = Backbone(
             sampling_rate=conf.fs,
             num_channels=conf.num_channels,
-            n_fft=conf.windowSize,
+            n_fft=self.n_fft,
             n_bands=conf.num_bands,
             hidden_size=conf.baseSize,
             num_heads=conf.nHead,
-            num_pitches=len(self.target_midi_pitch),
             ffn_hidden_size_factor=conf.hiddenFactor,
             num_layers=conf.nLayers,
             scoring_expansion_factor=conf.scoringExpansionFactor,
             dropout=conf.contextDropoutProb,
+            target_midi_pitches=self.target_midi_pitch,
+            band_split_type=conf.band_split_type,
         )
 
     def getDevice(self):
@@ -167,7 +170,7 @@ class TransKun(torch.nn.Module):
         inputs = einops.rearrange(inputs, "b c t -> (b c) t")
         spectrogram = torch.stft(
             input=inputs,
-            n_fft=self.window_size,
+            n_fft=self.n_fft,
             hop_length=self.hop_size,
             win_length=self.window_size,
             window=torch.hann_window(
@@ -192,9 +195,10 @@ class TransKun(torch.nn.Module):
 
         ctx, mask = self.backbone(norm_spectrogram)
 
-        separated_spectrogram = spectrogram_complex * mask
+        # mask: [B, C, N, F, T]
+        separated_spectrogram = spectrogram_complex[:, :, None] * mask
         separated_spectrogram = einops.rearrange(
-            separated_spectrogram, "b c f t -> (b c) f t"
+            separated_spectrogram, "b c n f t -> (b c n) f t"
         )
         recon_audio = torch.istft(
             separated_spectrogram,
@@ -209,7 +213,7 @@ class TransKun(torch.nn.Module):
             length=istft_length,
         )  # [B*C, T]
         recon_audio = einops.rearrange(
-            recon_audio, "(b c) t -> b c t", c=self.num_channels
+            recon_audio, "(b c n) t -> b c n t", c=self.num_channels, n=self.num_stems
         )
 
         # [ nStep, nStep, nBatch, nSym ]
@@ -227,12 +231,13 @@ class TransKun(torch.nn.Module):
 
     def log_prob(self, inputs, notesBatch, target_audio=None):
         B = inputs.shape[0]
-        # [B, C, N]
+        # [B, C, T]
         inputs = inputs.transpose(-1, -2)
 
         device = inputs.device
+        # target_audio: [B, T, N, C]
         if target_audio is not None:
-            target_audio = target_audio.transpose(-1, -2)
+            target_audio = target_audio.permute(0, 3, 2, 1)  # [B, C, N, T]
 
         crfBatch, ctxBatch, recon_audio = self.process_frames_batch(inputs)
 
@@ -248,9 +253,9 @@ class TransKun(torch.nn.Module):
                 return_as_loss=True,
             )
             loss_wmse = log_wmse(
-                inputs[:, :, :],
-                recon_audio[:, :, None, :],
-                target_audio[:, :, None, :],
+                inputs,
+                recon_audio,
+                target_audio,
             )
 
         # prepare groundtruth
@@ -738,9 +743,6 @@ class TransKun(torch.nn.Module):
 
         x = x.transpose(-1, -2)
 
-        # gain normalization
-        # x = (x-x.mean())/(x.std()+1e-8)
-
         padTimeBegin = segmentSizeInSecond - stepInSecond
 
         x = F.pad(
@@ -754,18 +756,21 @@ class TransKun(torch.nn.Module):
         eventsByType = defaultdict(list)
         startFrameIdx = math.floor(padTimeBegin * self.fs / self.hop_size)
         startPos = [startFrameIdx] * len(self.target_midi_pitch)
-        # startPos =None
 
         stepSize = math.ceil(stepInSecond * self.fs / self.hop_size) * self.hop_size
         segmentSize = math.ceil(segmentSizeInSecond * self.fs)
 
         total_length = x.shape[-1]  # 元波形長 (padding 後)
         recon_buffer = torch.zeros(
-            self.num_channels, total_length, device=x.device, dtype=x.dtype
+            self.num_channels,
+            self.num_stems,
+            total_length,
+            device=x.device,
+            dtype=x.dtype,
         )
         window_buffer = torch.zeros_like(recon_buffer)  # 窓の重なりを計算するため
         ola_window = torch.hann_window(segmentSize, device=x.device, dtype=x.dtype)
-        ola_window = ola_window.unsqueeze(0)  # (1, segmentSize)
+        ola_window = ola_window[None, None, :]  # (1, 1, segmentSize)
 
         for i in range(0, nSample, stepSize):
             # t1 = time.time()
@@ -797,7 +802,7 @@ class TransKun(torch.nn.Module):
                 onsetBound=onsetBound,
                 lastFrameIdx=lastFrameIdx,
             )
-            recon_audio = recon_audio[0]  # (C, segmentSize)
+            recon_audio = recon_audio[0]  # (C, N, segmentSize)
             curEvents = curEvents[0]
 
             # セグメント長と実際の recon_audio 長が違う場合に備えてクロップ
@@ -805,8 +810,8 @@ class TransKun(torch.nn.Module):
             end_idx = min(i + seg_len, recon_buffer.shape[-1])
             valid = end_idx - i  # この区間だけ書き込める
             win = ola_window[..., :seg_len]
-            recon_buffer[:, i:end_idx] += recon_audio[:, :valid] * win[:, :valid]
-            window_buffer[:, i:end_idx] += win[:, :valid]
+            recon_buffer[..., i:end_idx] += recon_audio[..., :valid] * win[..., :valid]
+            window_buffer[..., i:end_idx] += win[..., :valid]
 
             startPos = []
             for k in lastP:
@@ -862,6 +867,6 @@ class TransKun(torch.nn.Module):
 
         # パディング除去
         pad_len = math.ceil(padTimeBegin * self.fs)
-        recon_buffer = recon_buffer[:, pad_len:-pad_len]
+        recon_buffer = recon_buffer[..., pad_len:-pad_len]
 
         return eventsAll, recon_buffer

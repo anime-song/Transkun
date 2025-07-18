@@ -122,7 +122,14 @@ def initializeCheckpoint(Model, device, max_lr, weight_decay, nIter, conf):
 
     optimizerGroup = getOptimizerGroup(model)
 
-    optimizer = torch.optim.Adam(optimizerGroup, max_lr)
+    optimizer = optim.AdaBelief(
+        optimizerGroup,
+        max_lr,
+        weight_decouple=True,
+        eps=1e-8,
+        weight_decay=weight_decay,
+        rectify=True,
+    )
 
     lrScheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -157,11 +164,18 @@ def load_checkpoint(Model, conf, filename, device, strict=False):
     startIter = checkpoint.get("nIter", 0)
 
     model = Model(conf=conf).to(device)
-    model = torch.compile(model, mode="max-autotune")
+    model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 
     optimizerGroup = getOptimizerGroup(model)
 
-    optimizer = torch.optim.Adam(optimizerGroup, 1e-4)
+    optimizer = optim.AdaBelief(
+        optimizerGroup,
+        1e-5,
+        weight_decouple=True,
+        eps=1e-8,
+        weight_decay=1e-2,
+        rectify=True,
+    )
 
     lrScheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -260,9 +274,18 @@ def doValidation(model, dataset, device):
     nCorrect = sum([e["nCorrect"] for e in resultAll])
 
     meanNLLPerSecond = -logPAgg / lengthAgg
-    precision = nCorrect / nEst
-    recall = nCorrect / nGT
-    f1 = 2 * precision * recall / (precision + recall)
+    if nEst == 0:
+        precision = 0.0
+    else:
+        precision = nCorrect / nEst
+    if nGT == 0:
+        recall = 0.0
+    else:
+        recall = nCorrect / nGT
+    if (precision + recall) == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
 
     return {
         "meanNLL": meanNLLPerSecond,

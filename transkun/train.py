@@ -278,15 +278,25 @@ def train(workerId, filename, runSeed, args):
                 writer.add_scalar(f"Loss/train", loss.item(), globalStep)
                 writer.add_scalar(f"Optimizer/gradNorm", totalNorm.item(), globalStep)
                 writer.add_scalar(f"Optimizer/clipValue", curClipValue, globalStep)
-                writer.add_scalar(f"Loss/train_spec", loss_wmse.item(), globalStep)
+                writer.add_scalar(f"Loss/train_log_wmse", loss_wmse.item(), globalStep)
                 if computeStats:
-                    nGT = totalGT.item() + 1e-4
-                    nEst = totalEst.item() + 1e-4
-                    nCorrect = totalCorrect.item() + 1e-4
-                    precision = nCorrect / nEst
-                    recall = nCorrect / nGT
+                    num_ground_truth = totalGT.item() + 1e-4
+                    num_estimated = totalEst.item() + 1e-4
+                    num_correct = totalCorrect.item() + 1e-4
+                    if num_estimated == 0:
+                        precision = 0.0
+                    else:
+                        precision = num_correct / num_estimated
+                    if num_ground_truth == 0:
+                        recall = 0.0
+                    else:
+                        recall = num_correct / num_ground_truth
                     f1 = 2 * precision * recall / (precision + recall)
-                    print("nGT:{} nEst:{} nCorrect:{}".format(nGT, nEst, nCorrect))
+                    print(
+                        "nGT:{} nEst:{} nCorrect:{}".format(
+                            num_ground_truth, num_estimated, num_correct
+                        )
+                    )
 
                     writer.add_scalar(f"Loss/train_f1", f1, globalStep)
                     writer.add_scalar(f"Loss/train_precision", precision, globalStep)
@@ -295,8 +305,14 @@ def train(workerId, filename, runSeed, args):
                     nGTFramewise = totalGTFramewise.item() + 1e-4
                     nEstFramewise = totalEstFramewise.item() + 1e-4
                     nCorrectFramewise = totalCorrectFramewise.item() + 1e-4
-                    precisionFrame = nCorrectFramewise / nEstFramewise
-                    recallFrame = nCorrectFramewise / nGTFramewise
+                    if nEstFramewise == 0.0:
+                        precisionFrame = 0.0
+                    else:
+                        precisionFrame = nCorrectFramewise / nEstFramewise
+                    if nGTFramewise == 0.0:
+                        recallFrame = 0.0
+                    else:
+                        recallFrame = nCorrectFramewise / nGTFramewise
                     f1Frame = (
                         2
                         * precisionFrame
@@ -304,8 +320,8 @@ def train(workerId, filename, runSeed, args):
                         / (precisionFrame + recallFrame)
                     )
 
-                    mseVelocity = totalSEVelocity.item() / nGT
-                    mseOF = totalSEOF.item() / nGT
+                    mseVelocity = totalSEVelocity.item() / num_ground_truth
+                    mseOF = totalSEOF.item() / num_ground_truth
 
                     writer.add_scalar(f"Loss/train_f1_frame", f1Frame, globalStep)
                     writer.add_scalar(
@@ -410,7 +426,7 @@ if __name__ == "__main__":
     parser.add_argument("--datasetMetaFile_train", required=True)
     parser.add_argument("--datasetMetaFile_val", required=True)
 
-    parser.add_argument("--batchSize", default=6, type=int)
+    parser.add_argument("--batchSize", default=4, type=int)
     parser.add_argument("--hopSize", required=False, type=float)
     parser.add_argument("--chunkSize", required=False, type=float)
     parser.add_argument("--dataLoaderWorkers", default=2, type=int)
