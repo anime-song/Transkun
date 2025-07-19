@@ -401,6 +401,7 @@ class MultiHeadAttention(nn.Module):
         cos, sin = self.rope(q.shape[-2], dtype=q.dtype, device=q.device)
         q, k = apply_rotary_embedding(q, k, cos, sin)
 
+        q, k, v = (q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16))
         with sdpa_kernel(
             [
                 SDPBackend.FLASH_ATTENTION,
@@ -408,8 +409,7 @@ class MultiHeadAttention(nn.Module):
                 SDPBackend.MATH,
             ]
         ):
-            with torch.autocast(device_type=q.device.type, dtype=torch.bfloat16):
-                fetched = F.scaled_dot_product_attention(q, k, v)
+            fetched = F.scaled_dot_product_attention(q, k, v)
 
         gates = self.to_gates(x)
         gates = einops.rearrange(gates, "b t h -> b h t 1").sigmoid()
@@ -543,10 +543,42 @@ class Backbone(nn.Module):
             num_channels=self.num_channels,
         )
 
+        self.down_conv = nn.Sequential(
+            nn.ConstantPad2d((0, 0, 4, 3), value=0.0),
+            nn.Conv2d(
+                hidden_size, hidden_size * 2, kernel_size=3, padding=1, stride=(2, 1)
+            ),
+            nn.GroupNorm(4, hidden_size * 2),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_size * 2,
+                hidden_size * 4,
+                kernel_size=3,
+                padding=1,
+                stride=(2, 1),
+            ),
+            nn.GroupNorm(4, hidden_size * 4),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_size * 4,
+                hidden_size * 4,
+                kernel_size=3,
+                padding=1,
+                stride=(2, 1),
+            ),
+            nn.GroupNorm(4, hidden_size * 4),
+            nn.GELU(),
+            nn.Conv2d(hidden_size * 4, hidden_size * 8, kernel_size=3, padding=1),
+            nn.GroupNorm(4, hidden_size * 8),
+        )
+        self.up_conv = nn.ConvTranspose1d(
+            hidden_size * 8, hidden_size, kernel_size=8, stride=8
+        )
+
         encoder_layers = [
             BandSplitRoformerLayer(
-                input_size=hidden_size,
-                hidden_size=hidden_size,
+                input_size=hidden_size * 8,
+                hidden_size=hidden_size * 8,
                 num_heads=num_heads,
                 ffn_hidden_size_factor=ffn_hidden_size_factor,
                 dropout=dropout,
@@ -585,7 +617,7 @@ class Backbone(nn.Module):
             ]
         )
 
-        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size)
+        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size * 8)
         self.register_buffer(
             "pitch_ids",
             torch.arange(self.num_pitches, dtype=torch.long),
@@ -600,25 +632,39 @@ class Backbone(nn.Module):
             checkpoint = checkpointByPass
 
         x = einops.rearrange(x, "b c t f -> b t c f")
+        original_time_steps = x.shape[1]
 
         # 勾配が流れない問題に対処
         x = checkpoint(
             self.band_split, x, use_reentrant=False
         )  # (B, T, K, hidden_size)
 
+        # ダウンサンプリング
+        x = x.permute(0, 3, 1, 2)  # (B, hidden_size, T, K)
+        x = self.down_conv(x)
+        x = x.permute(0, 2, 3, 1)  # (B, downT, K, hidden_size*8)
+
         # バンド軸にピッチクエリを追加
         B, T, K, D = x.shape
         pitch_query = self.pitch_id_embed(self.pitch_ids)  # [1, 1, E, D]
-        pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, T, E, D]
-        x = torch.cat([x, pitch_query], dim=2)  # [B, T, K+E, D]
+        pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, downT, E, D]
+        x = torch.cat([x, pitch_query], dim=2)  # [B, downT, K+E, D]
 
         x = F.pad(x, (0, 0, 1, 0, 1, 0))
 
         for layer in self.encoder_layers:
             x = checkpoint(layer, x, use_reentrant=False)
-        # x: [B, T, K+E, D]
+        # x: [B, downT, K+E, D]
 
         x = x[:, 1:, 1:, :]
+
+        # アップサンプリング
+        x = einops.rearrange(x, "b t ke d -> (b ke) d t")
+        x = self.up_conv(x)
+        x = einops.rearrange(
+            x, "(b ke) d t -> b t ke d", ke=self.num_bands + self.num_pitches
+        )
+        x = x[:, :original_time_steps]
 
         # 音源分離マスク
         mask_list = []
