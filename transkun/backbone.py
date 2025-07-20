@@ -7,7 +7,6 @@ import torch.utils.checkpoint
 import numpy as np
 import librosa
 import einops
-from typing import Tuple
 from .utils import checkpointByPass
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from typing import List, Tuple
@@ -173,17 +172,16 @@ class BandSplit(torch.nn.Module):
         self.num_bands = len(band_indices)
         self.projections = torch.nn.ModuleList([])
         for i in range(self.num_bands):
-            sub_band_freqs = len(band_indices[i]) * 2 * num_channels
+            sub_band_freqs = len(band_indices[i]) * num_channels * 2
             self.projections.append(
                 torch.nn.Sequential(
                     RMSNorm(sub_band_freqs),
-                    torch.nn.Linear(sub_band_freqs, hidden_size, bias=False),
+                    torch.nn.Linear(sub_band_freqs, hidden_size),
                 )
             )
 
     def forward(self, x):
         # x: (B, T, C, F)
-
         sub_band_list = []
         for i, proj_layer in enumerate(self.projections):
             band_indices = getattr(self, f"band_idx_{i}")
@@ -241,7 +239,7 @@ class MaskEstimator(nn.Module):
         self.num_bands = len(band_indices)
         self.projections = torch.nn.ModuleList([])
         for i in range(self.num_bands):
-            sub_band_freqs = len(band_indices[i]) * 2 * num_channels
+            sub_band_freqs = len(band_indices[i]) * num_channels * 2
             self.projections.append(
                 BandMaskMLP(
                     input_dim=input_dim,
@@ -256,6 +254,7 @@ class MaskEstimator(nn.Module):
 
         out = []
         sub_band_list = torch.unbind(x, dim=2)  # list([B, T, D])
+        assert len(sub_band_list) == len(self.projections)
         for i, proj_layer in enumerate(self.projections):
             sub_band = proj_layer(sub_band_list[i])  # (B, T, sub_band_freqs)
             sub_band = einops.rearrange(
@@ -375,23 +374,12 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
 
         self.to_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=False)
-        self.to_gates = nn.Linear(hidden_size, self.num_heads)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
         self.rope = RotaryEmbeddings(
             head_dim=self.head_dim,
             learned=False,
         )
-
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        nn.init.xavier_uniform_(self.to_qkv.weight)
-        if self.to_qkv.bias is not None:
-            nn.init.zeros_(self.to_qkv.bias)
-        nn.init.xavier_uniform_(self.out_proj.weight)
-        if self.out_proj.bias is not None:
-            nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x):
         q, k, v = einops.rearrange(
@@ -411,10 +399,7 @@ class MultiHeadAttention(nn.Module):
         ):
             fetched = F.scaled_dot_product_attention(q, k, v)
 
-        gates = self.to_gates(x)
-        gates = einops.rearrange(gates, "b t h -> b h t 1").sigmoid()
-
-        fetched = fetched.float() * gates
+        fetched = fetched.float()
         fetched = einops.rearrange(fetched, "b h t d -> b t (h d)")
         return self.out_proj(fetched)
 
@@ -488,15 +473,14 @@ class BandSplitRoformerLayer(nn.Module):
         B, T, K, F = x.shape
 
         # 時間軸Transformer
-        x = x.reshape(B * K, T, F).contiguous()  # [B*K, T, F]
+        x = einops.rearrange(x, "b t k f -> (b k) t f")  # [B*K, T, F]
         x = self.time_roformer(x)
-        x = x.reshape(B, K, T, F).transpose(1, 2).contiguous()  # [B, T, K, F]
+        x = einops.rearrange(x, "(b k) t f -> b t k f", k=K)  # [B, T, K, F]
 
         # バンド軸Transformer
         x = x.reshape(B * T, K, F)  # [B*T, K, F]
         x = self.band_roformer(x)
         x = x.reshape(B, T, K, F)
-
         return x
 
 
@@ -506,6 +490,7 @@ class Backbone(nn.Module):
         sampling_rate: int,
         num_channels: int,
         n_fft: int,
+        hop_size: int,
         n_bands: int,
         hidden_size: int,
         num_heads: int,
@@ -524,6 +509,11 @@ class Backbone(nn.Module):
         self.use_gradient_checkpoint = use_gradient_checkpoint
         self.num_channels = num_channels
         self.n_fft = n_fft
+        self.window_size = n_fft
+        self.band_split_type = band_split_type
+        self.sampling_rate = sampling_rate
+        self.hop_size = hop_size
+        self.num_stems = num_stems
 
         if band_split_type == "bs":
             _, self.band_indices = build_band_indices(
@@ -531,7 +521,7 @@ class Backbone(nn.Module):
             )
         elif band_split_type == "mel":
             self.band_indices = build_mel_band_indices(
-                sr=sampling_rate, n_fft=n_fft, n_bands=n_bands
+                sampling_rate=sampling_rate, n_fft=n_fft, n_bands=n_bands
             )
         else:
             raise NotImplementedError("サポートしていない band_split_type です")
@@ -575,17 +565,18 @@ class Backbone(nn.Module):
             hidden_size * 8, hidden_size, kernel_size=8, stride=8
         )
 
-        encoder_layers = [
-            BandSplitRoformerLayer(
-                input_size=hidden_size * 8,
-                hidden_size=hidden_size * 8,
-                num_heads=num_heads,
-                ffn_hidden_size_factor=ffn_hidden_size_factor,
-                dropout=dropout,
-            )
-            for _ in range(num_layers)
-        ]
-        self.encoder_layers = nn.ModuleList(encoder_layers)
+        self.encoder_layers = nn.ModuleList(
+            [
+                BandSplitRoformerLayer(
+                    input_size=hidden_size * 8,
+                    hidden_size=hidden_size * 8,
+                    num_heads=num_heads,
+                    ffn_hidden_size_factor=ffn_hidden_size_factor,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         self.last_proj = nn.Linear(
             self.hidden_size, self.hidden_size * scoring_expansion_factor
@@ -624,12 +615,66 @@ class Backbone(nn.Module):
             persistent=False,
         )
 
+    def to_spectrogram(self, inputs: torch.Tensor) -> torch.Tensor:
+        # (B, C, T)
+        inputs = einops.rearrange(inputs, "b c t -> (b c) t")
+        spectrogram = torch.stft(
+            input=inputs,
+            n_fft=self.n_fft,
+            hop_length=self.hop_size,
+            win_length=self.window_size,
+            window=torch.hann_window(
+                self.window_size, device=inputs.device, dtype=inputs.dtype
+            ),
+            center=True,
+            return_complex=True,
+        )
+        spectrogram = einops.rearrange(
+            spectrogram, "(b c) f t -> b c f t", c=self.num_channels
+        )
+        spectrogram_complex = spectrogram  # [B, C, F, T]
+
+        spectrogram = torch.view_as_real(spectrogram)
+        spectrogram = einops.rearrange(spectrogram, "b c f t s -> b (c s) t f", s=2)
+        return spectrogram, spectrogram_complex
+
+    def to_recon_audio(
+        self,
+        mask: torch.Tensor,
+        original_spec_complex: torch.Tensor,
+        original_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        # mask: [B, C, N, F, T]
+        separated_spectrogram = original_spec_complex[:, :, None] * mask
+        separated_spectrogram = einops.rearrange(
+            separated_spectrogram, "b c n f t -> (b c n) f t"
+        )
+        recon_audio = torch.istft(
+            separated_spectrogram,
+            n_fft=self.window_size,
+            hop_length=self.hop_size,
+            win_length=self.window_size,
+            window=torch.hann_window(self.window_size, device=device, dtype=dtype),
+            center=True,
+            return_complex=False,
+            length=original_length,
+        )  # [B*C, T]
+        recon_audio = einops.rearrange(
+            recon_audio, "(b c n) t -> b c n t", c=self.num_channels, n=self.num_stems
+        )
+        return recon_audio
+
     def forward(self, x):
-        # x: [B, C*S, T, F]
+        # x: (B, C, T)
         if self.use_gradient_checkpoint or self.training:
             checkpoint = torch.utils.checkpoint.checkpoint
         else:
             checkpoint = checkpointByPass
+
+        istft_length = x.shape[-1]
+        x, original_spec_complex = self.to_spectrogram(x)  # x: [B, C*S, T, F]
 
         x = einops.rearrange(x, "b c t f -> b t c f")
         original_time_steps = x.shape[1]
@@ -645,18 +690,13 @@ class Backbone(nn.Module):
         x = x.permute(0, 2, 3, 1)  # (B, downT, K, hidden_size*8)
 
         # バンド軸にピッチクエリを追加
-        B, T, K, D = x.shape
+        B, T, _, _ = x.shape
         pitch_query = self.pitch_id_embed(self.pitch_ids)  # [1, 1, E, D]
         pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, downT, E, D]
         x = torch.cat([x, pitch_query], dim=2)  # [B, downT, K+E, D]
-
-        x = F.pad(x, (0, 0, 1, 0, 1, 0))
-
         for layer in self.encoder_layers:
             x = checkpoint(layer, x, use_reentrant=False)
         # x: [B, downT, K+E, D]
-
-        x = x[:, 1:, 1:, :]
 
         # アップサンプリング
         x = einops.rearrange(x, "b t ke d -> (b ke) d t")
@@ -679,29 +719,40 @@ class Backbone(nn.Module):
             mask_list.append(pred_mask)
 
         mask_all = torch.stack(mask_list, dim=-2)  # [B, T, C, N, F]
-        # 周波数ビンで重なる部分を加算する
-        B, T, C, N, F_concat = mask_all.shape
-        F_total = self.n_fft // 2 + 1
-        mask_sum = torch.zeros(
-            (B, T, C, N, F_total), dtype=mask_all.dtype, device=mask_all.device
-        )
-        freq_idx = self.freq_indices.view(1, 1, 1, 1, -1).expand(
-            B, T, C, N, -1
-        )  # [B, T, C, N, F_concat]
-        mask_sum.scatter_add_(
-            dim=-1,
-            index=freq_idx,
-            src=mask_all,
-        )
+        if self.band_split_type == "mel":
+            # 周波数ビンで重なる部分を加算する
+            B, T, C, N, F_concat = mask_all.shape
+            F_total = self.n_fft // 2 + 1
+            mask_sum = torch.zeros(
+                (B, T, C, N, F_total), dtype=mask_all.dtype, device=mask_all.device
+            )
+            freq_idx = self.freq_indices.view(1, 1, 1, 1, -1).expand(
+                B, T, C, N, -1
+            )  # [B, T, C, N, F_concat]
+            mask_sum.scatter_add_(
+                dim=-1,
+                index=freq_idx,
+                src=mask_all,
+            )
 
-        # 重なった本数で割って平均
-        denom = self.num_bands_per_freq.clamp(min=1e-8)  # [F_total]
-        denom = denom.view(1, 1, 1, 1, -1)  # broadcast
-        mask_avg = mask_sum / denom  # [B, T, C, N, F_total]
-        mask_avg = einops.rearrange(mask_avg, "b t c n f -> b c n f t")
+            # 重なった本数で割って平均
+            denom = self.num_bands_per_freq.clamp(min=1e-8)  # [F_total]
+            denom = denom.view(1, 1, 1, 1, -1)  # broadcast
+            mask_avg = mask_sum / denom  # [B, T, C, N, F_total]
+            mask_avg = einops.rearrange(mask_avg, "b t c n f -> b c n f t")
+        else:
+            mask_avg = einops.rearrange(mask_all, "b t c n f -> b c n f t")
+
+        recon_audio = self.to_recon_audio(
+            mask=mask_avg,
+            original_spec_complex=original_spec_complex,
+            original_length=istft_length,
+            dtype=x.dtype,
+            device=x.device,
+        )
 
         # イベント列のみ取り出す
         event_x = x[:, :, -self.num_pitches :, :]  # [B, T, E, D]
         event_x = event_x.permute(0, 2, 1, 3).contiguous()  # [B, E, T, D]
         event_x = self.last_proj(event_x)
-        return event_x, mask_avg
+        return event_x, recon_audio

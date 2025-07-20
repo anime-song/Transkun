@@ -147,6 +147,7 @@ class TransKun(torch.nn.Module):
             sampling_rate=conf.fs,
             num_channels=conf.num_channels,
             n_fft=self.n_fft,
+            hop_size=conf.hopSize,
             n_bands=conf.num_bands,
             hidden_size=conf.baseSize,
             num_heads=conf.nHead,
@@ -163,58 +164,7 @@ class TransKun(torch.nn.Module):
 
     def process_frames_batch(self, inputs):
         # inputs: (B, C, N)
-        B = inputs.shape[0]
-        istft_length = inputs.shape[-1]
-
-        # (B, C, n_frames)
-        inputs = einops.rearrange(inputs, "b c t -> (b c) t")
-        spectrogram = torch.stft(
-            input=inputs,
-            n_fft=self.n_fft,
-            hop_length=self.hop_size,
-            win_length=self.window_size,
-            window=torch.hann_window(
-                self.window_size, device=inputs.device, dtype=inputs.dtype
-            ),
-            center=True,
-            return_complex=True,
-        )
-        spectrogram = einops.rearrange(
-            spectrogram, "(b c) f t -> b c f t", c=self.num_channels
-        )
-        spectrogram_complex = spectrogram  # [B, C, F, T]
-
-        # ノーマライズ
-        spectrogram = torch.view_as_real(spectrogram)
-        mean = torch.mean(spectrogram, dim=[1, 2, 3], keepdim=True)
-        std = torch.std(spectrogram, dim=[1, 2, 3], keepdim=True)
-        norm_spectrogram = (spectrogram - mean) / (std + 1e-8)
-        norm_spectrogram = einops.rearrange(
-            norm_spectrogram, "b c f t s -> b (c s) t f", s=2
-        )
-
-        ctx, mask = self.backbone(norm_spectrogram)
-
-        # mask: [B, C, N, F, T]
-        separated_spectrogram = spectrogram_complex[:, :, None] * mask
-        separated_spectrogram = einops.rearrange(
-            separated_spectrogram, "b c n f t -> (b c n) f t"
-        )
-        recon_audio = torch.istft(
-            separated_spectrogram,
-            n_fft=self.window_size,
-            hop_length=self.hop_size,
-            win_length=self.window_size,
-            window=torch.hann_window(
-                self.window_size, device=inputs.device, dtype=inputs.dtype
-            ),
-            center=True,
-            return_complex=False,
-            length=istft_length,
-        )  # [B*C, T]
-        recon_audio = einops.rearrange(
-            recon_audio, "(b c n) t -> b c n t", c=self.num_channels, n=self.num_stems
-        )
+        ctx, recon_audio = self.backbone(inputs)
 
         # [ nStep, nStep, nBatch, nSym ]
         S_batch, S_skip_batch = self.scorer(ctx)

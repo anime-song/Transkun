@@ -16,35 +16,16 @@ import argparse
 import moduleconf
 
 
-def collect_grad_stats(model, learning_rate: float | None = None, eps: float = 1e-12):
-    stats = []
-    for parameter_name, parameter in model.named_parameters():
-        if parameter.grad is None:
-            continue
-
-        grad_data = parameter.grad.detach()
-        param_data = parameter.detach()
-
-        grad_rms = grad_data.pow(2).mean().sqrt().item()
-        param_rms = param_data.pow(2).mean().sqrt().item()
-        grad_l2 = grad_data.norm().item()
-        param_l2 = param_data.norm().item()
-
-        if learning_rate is not None:
-            relative_update = learning_rate * grad_rms / (param_rms + eps)
-        else:
-            relative_update = float("nan")
-
-        stats.append(
-            {
-                "name": parameter_name,
-                "grad_rms": grad_rms,
-                "grad_l2": grad_l2,
-                "param_rms": param_rms,
-                "param_l2": param_l2,
-            }
-        )
-    return stats
+def check_gradients(model) -> None:
+    # ------- 検証 -------
+    params_with_grad = [p for p in model.parameters() if p.grad is not None]
+    assert len(params_with_grad) == sum(
+        1 for _ in model.parameters()
+    ), "一部 grad が None"
+    assert all(
+        torch.isfinite(p.grad).all() for p in params_with_grad
+    ), "grad に Inf / NaN"
+    print(f"✓gradients OK")
 
 
 def train(workerId, filename, runSeed, args):
@@ -222,7 +203,7 @@ def train(workerId, filename, runSeed, args):
             (loss / 50).backward()
 
             # 勾配の確認
-            # print(collect_grad_stats(model))
+            # check_gradients(model)
 
             totalBatch = totalBatch + 1
             totalLen = totalLen + audioLength
