@@ -348,43 +348,17 @@ class Backbone(nn.Module):
             num_channels=self.num_channels,
         )
 
-        self.down_conv = nn.Sequential(
-            nn.ConstantPad2d((0, 0, 4, 3), value=0.0),
-            nn.Conv2d(
-                hidden_size, hidden_size * 2, kernel_size=3, padding=1, stride=(2, 1)
-            ),
-            nn.GroupNorm(4, hidden_size * 2),
-            nn.GELU(),
-            nn.Conv2d(
-                hidden_size * 2,
-                hidden_size * 4,
-                kernel_size=3,
-                padding=1,
-                stride=(2, 1),
-            ),
-            nn.GroupNorm(4, hidden_size * 4),
-            nn.GELU(),
-            nn.Conv2d(
-                hidden_size * 4,
-                hidden_size * 4,
-                kernel_size=3,
-                padding=1,
-                stride=(2, 1),
-            ),
-            nn.GroupNorm(4, hidden_size * 4),
-            nn.GELU(),
-            nn.Conv2d(hidden_size * 4, hidden_size * 8, kernel_size=3, padding=1),
-            nn.GroupNorm(4, hidden_size * 8),
+        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size)
+        self.register_buffer(
+            "pitch_ids",
+            torch.arange(self.num_pitches, dtype=torch.long),
+            persistent=False,
         )
-        self.up_conv = nn.ConvTranspose1d(
-            hidden_size * 8, hidden_size, kernel_size=8, stride=8
-        )
-
         self.encoder_layers = nn.ModuleList(
             [
                 BandSplitRoformerLayer(
-                    input_size=hidden_size * 8,
-                    hidden_size=hidden_size * 8,
+                    input_size=hidden_size,
+                    hidden_size=hidden_size,
                     num_heads=num_heads,
                     ffn_hidden_size_factor=ffn_hidden_size_factor,
                     dropout=dropout,
@@ -392,11 +366,6 @@ class Backbone(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-
-        self.last_proj = nn.Linear(
-            self.hidden_size, self.hidden_size * scoring_expansion_factor
-        )
-
         self.register_buffer(
             "freq_indices",
             torch.tensor(np.concatenate(self.band_indices), dtype=torch.long),
@@ -423,11 +392,8 @@ class Backbone(nn.Module):
             ]
         )
 
-        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size * 8)
-        self.register_buffer(
-            "pitch_ids",
-            torch.arange(self.num_pitches, dtype=torch.long),
-            persistent=False,
+        self.last_proj = nn.Linear(
+            self.hidden_size, self.hidden_size * scoring_expansion_factor
         )
 
     def to_spectrogram(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -492,34 +458,20 @@ class Backbone(nn.Module):
         x, original_spec_complex = self.to_spectrogram(x)  # x: [B, C*S, T, F]
 
         x = einops.rearrange(x, "b c t f -> b t c f")
-        original_time_steps = x.shape[1]
 
         # 勾配が流れない問題に対処
         x = checkpoint(
             self.band_split, x, use_reentrant=False
         )  # (B, T, K, hidden_size)
 
-        # ダウンサンプリング
-        x = x.permute(0, 3, 1, 2)  # (B, hidden_size, T, K)
-        x = self.down_conv(x)
-        x = x.permute(0, 2, 3, 1)  # (B, downT, K, hidden_size*8)
-
         # バンド軸にピッチクエリを追加
         B, T, _, _ = x.shape
         pitch_query = self.pitch_id_embed(self.pitch_ids)  # [1, 1, E, D]
-        pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, downT, E, D]
-        x = torch.cat([x, pitch_query], dim=2)  # [B, downT, K+E, D]
+        pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, T, E, D]
+        x = torch.cat([x, pitch_query], dim=2)  # [B, T, K+E, D]
         for layer in self.encoder_layers:
             x = checkpoint(layer, x, use_reentrant=False)
-        # x: [B, downT, K+E, D]
-
-        # アップサンプリング
-        x = einops.rearrange(x, "b t ke d -> (b ke) d t")
-        x = self.up_conv(x)
-        x = einops.rearrange(
-            x, "(b ke) d t -> b t ke d", ke=self.num_bands + self.num_pitches
-        )
-        x = x[:, :original_time_steps]
+        # x: [B, T, K+E, D]
 
         # 音源分離マスク
         mask_list = []
