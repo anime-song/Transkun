@@ -108,7 +108,8 @@ def main():
     outputMidi.write(outPath)
 
     for i in range(recon_audio.shape[0]):
-        recon_np = recon_audio[i].transpose(0, 1).cpu().numpy()  # (T, C)
+        # recon_audio: (C, N, T)
+        recon_np = recon_audio[:, i].transpose(0, 1).cpu().numpy()  # (T, C)
         audio_path_obj = Path(audioPath)
         write_wav_path = audio_path_obj.with_name(
             f"{audio_path_obj.stem}_separated_{i}.wav"
