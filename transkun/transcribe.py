@@ -54,6 +54,10 @@ def main():
         required=False,
         help=" The segment size for processing the entire audio file (s), DEFAULT: the value defined in model conf",
     )
+    argumentParser.add_argument(
+        "--use_state_dict",
+        action="store_true",
+    )
 
     args = argumentParser.parse_args()
 
@@ -72,7 +76,11 @@ def main():
     model: TransKun = transkun(conf=conf).to(device)
     model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 
-    if "best_state_dict" not in checkpoint or checkpoint["best_state_dict"] is None:
+    if (
+        "best_state_dict" not in checkpoint
+        or checkpoint["best_state_dict"] is None
+        or args.use_state_dict
+    ):
         model.load_state_dict(checkpoint["state_dict"], strict=False)
     else:
         model.load_state_dict(checkpoint["best_state_dict"], strict=False)
