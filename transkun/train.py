@@ -114,7 +114,7 @@ def train(workerId, filename, runSeed, args):
     # create dataloader
 
     # this iterator should be constructed each time
-    batchSize = args.batchSize
+    batch_size = args.batch_size
     loss_spec_weight = conf.loss_spec_weight
 
     if args.hopSize is None:
@@ -148,7 +148,7 @@ def train(workerId, filename, runSeed, args):
 
         dataloader = torch.utils.data.DataLoader(
             dataIter,
-            batch_size=batchSize,
+            batch_size=batch_size,
             collate_fn=Data.collate_fn_batching,
             num_workers=args.dataLoaderWorkers,
             shuffle=True,
@@ -193,10 +193,10 @@ def train(workerId, filename, runSeed, args):
             target_audio = batch["target_audio"].to(device)
             audioLength = audioSlices.shape[1] / model.conf.fs
 
-            logp, (loss_wave, loss_wmse) = model.log_prob(
+            logp, (loss_spec, loss_wmse) = model.log_prob(
                 audioSlices, notesBatch, target_audio=target_audio
             )
-            loss_recon = (loss_wave * 1000.0 + loss_wmse) * loss_spec_weight
+            loss_recon = (loss_spec + loss_wmse) * loss_spec_weight
             loss_seq = -logp.sum(-1).mean()
             loss = loss_seq + loss_recon
 
@@ -245,12 +245,13 @@ def train(workerId, filename, runSeed, args):
             if workerId == 0:
                 t2 = time.time()
                 print(
-                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} log_wmse:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
+                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} log_wmse:{:0.4f} loss_spec:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
                         epoc,
                         idx / len(dataloader),
                         globalStep,
                         loss.item(),
                         loss_wmse.item(),
+                        loss_spec.item(),
                         totalNorm.item(),
                         curClipValue,
                         t2 - t1,
@@ -357,7 +358,7 @@ def train(workerId, filename, runSeed, args):
         )
         dataloaderVal = torch.utils.data.DataLoader(
             dataIterVal,
-            batch_size=2 * batchSize,
+            batch_size=2 * batch_size,
             collate_fn=Data.collate_fn,
             num_workers=args.dataLoaderWorkers,
             shuffle=True,
@@ -407,7 +408,7 @@ if __name__ == "__main__":
     parser.add_argument("--datasetMetaFile_train", required=True)
     parser.add_argument("--datasetMetaFile_val", required=True)
 
-    parser.add_argument("--batchSize", default=4, type=int)
+    parser.add_argument("--batch_size", default=4, type=int)
     parser.add_argument("--hopSize", required=False, type=float)
     parser.add_argument("--chunkSize", required=False, type=float)
     parser.add_argument("--dataLoaderWorkers", default=2, type=int)
