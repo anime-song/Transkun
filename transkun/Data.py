@@ -466,11 +466,18 @@ class AugmentatorAudiomentations:
             AddBackgroundNoise,
             SevenBandParametricEQ,
             PolarityInversion,
+            RoomSimulator,
         )
 
         transformList = [
             PitchShift(*pitchShiftRange, p=0.5),
             SevenBandParametricEQ(*eqDBRange, p=0.5),
+            PolarityInversion(p=0.5),
+            RoomSimulator(
+                calculation_mode="rt60",
+                max_order=3,
+                p=0.5,
+            ),
         ]
 
         self.transform = Compose(transformList)
