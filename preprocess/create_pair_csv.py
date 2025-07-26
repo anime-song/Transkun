@@ -18,8 +18,8 @@ def decide_split(stems: List[str]) -> Dict[str, str]:
     """stem → split(train/test/validation) 連番で決定"""
     stems_sorted = sorted(stems)  # 001, 002, 003, ...
     n_total = len(stems_sorted)
-    n_train = int(n_total * 0.90)
-    n_test = int(n_total * 0.05)
+    n_train = int(n_total * 0.95)
+    n_test = int(n_total * 0.00)
 
     mapping: Dict[str, str] = {}
     for idx, stem in enumerate(stems_sorted):
@@ -60,7 +60,7 @@ def main() -> None:
         raise SystemExit("piano_* フォルダが見つかりません。")
 
     # stem 一覧取得 → split 決定
-    stems = [p.stem.split("_")[0] for p in other_dir.glob("*_other.wav")]
+    stems = ["_".join(p.stem.split("_")[:-1]) for p in other_dir.glob("*_other.wav")]
     print(stems)
     if not stems:
         raise SystemExit("original_other に *_other.wav が見つかりません。")
