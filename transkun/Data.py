@@ -384,13 +384,13 @@ class DatasetMaestro:
         totalTime = sum(self.durations)
         print("totalDuration: ", totalTime)
 
-    def _load_piece(self, idx: int) -> dict:
+    def _load_piece(self, idx: int, create_index_events: bool = True) -> dict:
         """指定 idx の曲だけをロードして返す。"""
         with open(self.datasetAnnotationPicklePath, "rb") as fp:
             fp.seek(self.sample_offsets[idx])
             piece = pickle.load(fp)
         # インデックスがまだ無ければ遅延生成
-        if "index" not in piece:
+        if "index" not in piece and create_index_events:
             piece["index"] = createIndexEvents(piece["notes"])
         return piece
 
@@ -405,8 +405,30 @@ class DatasetMaestro:
         datasetAnnotationPicklePath = d["datasetAnnotationPicklePath"]
         self.__init__(datasetPath, datasetAnnotationPicklePath)
 
-    def fetchData(self, idx, begin, end, audioNormalize, notesStrictlyContained):
+    def fetchData(
+        self,
+        idx,
+        begin,
+        end,
+        audioNormalize,
+        notesStrictlyContained,
+        other_idx=None,
+        other_begin=None,
+        other_end=None,
+    ):
         piece = self._load_piece(idx)
+
+        # ランダムで他の曲のミックスを合成する
+        if other_idx is not None and other_begin is not None and other_end is not None:
+            other_piece = self._load_piece(
+                other_idx,
+                create_index_events=False,
+            )
+            piece["other_filename"] = other_piece["other_filename"]
+
+        if other_begin is None or other_end is None:
+            other_begin = begin
+            other_end = end
 
         # fetch the notes in this interval
         if end < 0 and begin < 0:
@@ -443,7 +465,9 @@ class DatasetMaestro:
         audioSlice, fs = readAudioSlice(audioPath, begin, end, audioNormalize)
 
         other_path = os.path.join(self.datasetPath, piece["other_filename"])
-        other_slice, fs = readAudioSlice(other_path, begin, end, audioNormalize)
+        other_slice, fs = readAudioSlice(
+            other_path, other_begin, other_end, audioNormalize
+        )
 
         return notes, audioSlice, other_slice, fs
 
@@ -665,13 +689,25 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
             raise IndexError()
 
         idx, begin, end = self.chunksAll[idx]
-        # print(begin, end)
+
+        other_idx = None
+        other_end = None
+        other_begin = None
+        if random.random() < 0.5:
+            # ランダムで他の曲のミックスを合成する
+            other_idx, other_begin, other_end = self.chunksAll[
+                random.randint(0, len(self.chunksAll) - 1)
+            ]
+
         notes, target_audio, other_slice, fs = self.dataset.fetchData(
             idx,
             begin,
             end,
             audioNormalize=self.audioNormalize,
             notesStrictlyContained=self.notesStrictlyContained,
+            other_idx=other_idx,
+            other_begin=other_begin,
+            other_end=other_end,
         )
 
         if self.augmentator is not None:
