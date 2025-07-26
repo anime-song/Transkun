@@ -7,9 +7,7 @@ from .utils import *
 from .Evaluation import *
 from .backbone import Backbone, ScaledInnerProductIntervalScorer
 from collections import defaultdict
-import einops
 from torch_log_wmse import LogWMSE
-from functools import partial
 from . import CRF
 
 
@@ -19,6 +17,7 @@ class ModelConfig:
         self.segmentSizeInSecond = 16
 
         self.hopSize = 1024
+        self.multi_stft_loss_hop_length = 256
         self.windowSize = 2048
         self.fs = 44100
         self.num_bands = 60
@@ -83,25 +82,27 @@ def multi_resolution_stft_loss(
     loss_weight: float = 1.0,
 ) -> torch.Tensor:
     b, c, n, t = recon_audio.shape
-    recon = recon_audio.reshape(-1, t)
-    target = target_audio.reshape(-1, t)
+    total_loss = recon_audio.new_tensor(0.0)
 
-    total_loss = recon.new_tensor(0.0)
-    for win_len in resolutions:
-        n_fft_sel = max(n_fft, win_len)
-        window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
+    for stem in range(n):
+        recon = recon_audio[:, :, stem].reshape(-1, t)  # (B*C, T)
+        target = target_audio[:, :, stem].reshape(-1, t)
 
-        loss_i = torch.utils.checkpoint.checkpoint(
-            _stft_l1,
-            recon,
-            target,
-            torch.tensor(n_fft_sel),
-            torch.tensor(hop_length),
-            torch.tensor(win_len),
-            window,
-            use_reentrant=False,
-        )
-        total_loss = total_loss + loss_i
+        for win_len in resolutions:
+            n_fft_sel = max(n_fft, win_len)
+            window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
+
+            loss_i = torch.utils.checkpoint.checkpoint(
+                _stft_l1,
+                recon,
+                target,
+                torch.tensor(n_fft_sel),
+                torch.tensor(hop_length),
+                torch.tensor(win_len),
+                window,
+                use_reentrant=False,
+            )
+            total_loss = total_loss + loss_i
     return total_loss * loss_weight
 
 
@@ -119,6 +120,7 @@ class TransKun(torch.nn.Module):
         self.num_channels = conf.num_channels
         self.n_fft = self.window_size
         self.num_stems = 2
+        self.multi_stft_loss_hop_length = conf.multi_stft_loss_hop_length
 
         self.segmentSizeInSecond = conf.segmentSizeInSecond
         self.segmentHopSizeInSecond = conf.segmentHopSizeInSecond
@@ -209,7 +211,7 @@ class TransKun(torch.nn.Module):
                 recon_audio=recon_audio,
                 target_audio=target_audio,
                 n_fft=self.n_fft,
-                hop_length=512,
+                hop_length=self.multi_stft_loss_hop_length,
             )
             log_wmse = LogWMSE(
                 audio_length=recon_audio.shape[-1] / self.fs,
