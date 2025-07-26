@@ -9,7 +9,7 @@ from .backbone import Backbone, ScaledInnerProductIntervalScorer
 from collections import defaultdict
 import einops
 from torch_log_wmse import LogWMSE
-
+from functools import partial
 from . import CRF
 
 
@@ -50,6 +50,29 @@ class ModelConfig:
 Config = ModelConfig
 
 
+def _stft_l1(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    n_fft: int,
+    hop_length: int,
+    win_length: int,
+    window: torch.Tensor,
+) -> torch.Tensor:
+    """
+    1 解像度分の L1 損失だけ返す小さな関数。
+    checkpoint で呼び出すため、すべての引数を Tensor にする。
+    """
+    # (B*C, T) -> 複素 STFT
+    spec_hat = torch.stft(
+        recon, n_fft, hop_length, win_length, window=window, return_complex=True
+    )
+    with torch.no_grad():  # 勾配不要なので保存しない
+        spec_ref = torch.stft(
+            target, n_fft, hop_length, win_length, window=window, return_complex=True
+        )
+    return F.l1_loss(spec_hat, spec_ref)
+
+
 def multi_resolution_stft_loss(
     recon_audio: torch.Tensor,
     target_audio: torch.Tensor,
@@ -59,40 +82,26 @@ def multi_resolution_stft_loss(
     window_fn=torch.hann_window,
     loss_weight: float = 1.0,
 ) -> torch.Tensor:
-    # バッチとチャネルを合体して 2D テンソルに
-    b, c, t = recon_audio.shape
+    b, c, n, t = recon_audio.shape
     recon = recon_audio.reshape(-1, t)
     target = target_audio.reshape(-1, t)
 
-    total_loss = 0.0
-    device = recon.device
-    dtype = recon.dtype
+    total_loss = recon.new_tensor(0.0)
+    for win_len in resolutions:
+        n_fft_sel = max(n_fft, win_len)
+        window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
 
-    for win_length in resolutions:
-        n_fft_sel = max(n_fft, win_length)
-        window = window_fn(win_length, device=device, dtype=dtype)
-
-        # 複素 STFT
-        Y_recon = torch.stft(
+        loss_i = torch.utils.checkpoint.checkpoint(
+            _stft_l1,
             recon,
-            n_fft=n_fft_sel,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=window,
-            return_complex=True,
+            target,
+            torch.tensor(n_fft_sel),
+            torch.tensor(hop_length),
+            torch.tensor(win_len),
+            window,
+            use_reentrant=False,
         )
-        with torch.no_grad():
-            Y_target = torch.stft(
-                target,
-                n_fft=n_fft_sel,
-                hop_length=hop_length,
-                win_length=win_length,
-                window=window,
-                return_complex=True,
-            )
-
-        total_loss = total_loss + F.l1_loss(Y_recon, Y_target)
-
+        total_loss = total_loss + loss_i
     return total_loss * loss_weight
 
 
@@ -191,12 +200,17 @@ class TransKun(torch.nn.Module):
 
         crfBatch, ctxBatch, recon_audio = self.process_frames_batch(inputs)
 
-        loss_wave = 0.0
+        loss_spec = torch.tensor(0.0, device=device)
         loss_wmse = 0.0
         if target_audio is not None:
             target_audio = target_audio[..., : recon_audio.shape[-1]]
 
-            loss_wave = F.l1_loss(recon_audio, target_audio)
+            loss_spec = multi_resolution_stft_loss(
+                recon_audio=recon_audio,
+                target_audio=target_audio,
+                n_fft=self.n_fft,
+                hop_length=512,
+            )
             log_wmse = LogWMSE(
                 audio_length=recon_audio.shape[-1] / self.fs,
                 sample_rate=self.fs,
@@ -299,7 +313,7 @@ class TransKun(torch.nn.Module):
 
         logProb = logProb.view(B, -1)
 
-        return logProb, (loss_wave, loss_wmse)
+        return logProb, (loss_spec, loss_wmse)
 
     def compute_stats_mireval(self, inputs, notes_batch):
         B = inputs.shape[0]
