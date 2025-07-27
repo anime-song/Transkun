@@ -10,12 +10,12 @@ import librosa
 
 
 def read_audio(path: str, sampling_rate: int):
-    y, sr = librosa.load(path, sr=sampling_rate, mono=False)
+    y, _ = librosa.load(path, sr=sampling_rate, mono=False)
 
     if y.ndim == 2:
         y = y.T
 
-    return sr, y
+    return y
 
 
 def main():
