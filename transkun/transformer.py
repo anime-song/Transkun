@@ -6,6 +6,26 @@ import einops
 from typing import Tuple
 
 
+def choose_low_precision_dtype() -> torch.dtype:
+    """
+    GPU の機能を調べて BF16 → FP16 → FP32 の順に
+    最も高速な演算 dtype を返す。
+    """
+    if not torch.cuda.is_available():
+        return torch.float32  # CPU 実行なら FP32 一択
+
+    # Ampere (sm80) 以降ならほぼ BF16 演算に対応
+    if torch.cuda.is_bf16_supported():  # PyTorch 2.1+
+        return torch.bfloat16
+
+    major_cc, _ = torch.cuda.get_device_capability()
+    # Pascal (sm60) 以降なら FP16 演算ユニットあり
+    if major_cc >= 6:
+        return torch.float16
+
+    return torch.float32  # それ以前の Maxwell など
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -127,6 +147,7 @@ class MultiHeadAttention(nn.Module):
             head_dim=self.head_dim,
             learned=False,
         )
+        self.lowp_dtype = choose_low_precision_dtype()
 
     def forward(self, x):
         q, k, v = einops.rearrange(
@@ -136,7 +157,9 @@ class MultiHeadAttention(nn.Module):
         cos, sin = self.rope(q.shape[-2], dtype=q.dtype, device=q.device)
         q, k = apply_rotary_embedding(q, k, cos, sin)
 
-        q, k, v = (q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16))
+        q = q.to(self.lowp_dtype)
+        k = k.to(self.lowp_dtype)
+        v = v.to(self.lowp_dtype)
         with sdpa_kernel(
             [
                 SDPBackend.FLASH_ATTENTION,
