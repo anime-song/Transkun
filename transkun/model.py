@@ -61,7 +61,7 @@ def _stft_l1(
     1 解像度分の L1 損失だけ返す小さな関数。
     checkpoint で呼び出すため、すべての引数を Tensor にする。
     """
-    # (B*C, T) -> 複素 STFT
+    # (B, T) -> 複素 STFT
     spec_hat = torch.stft(
         recon, n_fft, hop_length, win_length, window=window, return_complex=True
     )
@@ -85,25 +85,26 @@ def multi_resolution_stft_loss(
     total_loss = recon_audio.new_tensor(0.0)
 
     for stem in range(n):
-        recon = recon_audio[:, :, stem].reshape(-1, t)  # (B*C, T)
-        target = target_audio[:, :, stem].reshape(-1, t)
+        for channel in range(c):
+            recon = recon_audio[:, channel, stem].reshape(-1, t)  # (B, T)
+            target = target_audio[:, channel, stem].reshape(-1, t)
 
-        for win_len in resolutions:
-            n_fft_sel = max(n_fft, win_len)
-            window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
+            for win_len in resolutions:
+                n_fft_sel = max(n_fft, win_len)
+                window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
 
-            loss_i = torch.utils.checkpoint.checkpoint(
-                _stft_l1,
-                recon,
-                target,
-                torch.tensor(n_fft_sel),
-                torch.tensor(hop_length),
-                torch.tensor(win_len),
-                window,
-                use_reentrant=False,
-            )
-            total_loss = total_loss + loss_i
-    return total_loss * loss_weight
+                loss_i = torch.utils.checkpoint.checkpoint(
+                    _stft_l1,
+                    recon,
+                    target,
+                    torch.tensor(n_fft_sel),
+                    torch.tensor(hop_length),
+                    torch.tensor(win_len),
+                    window,
+                    use_reentrant=False,
+                )
+                total_loss = total_loss + loss_i
+    return total_loss / n / c * loss_weight
 
 
 class TransKun(torch.nn.Module):
@@ -365,7 +366,6 @@ class TransKun(torch.nn.Module):
 
         path = crfBatch.decode()
 
-        # print(sum([len(p) for p in path]))
         intervalsBatch = []
         velocityBatch = []
         ofRefinedGTBatch = []
@@ -376,11 +376,20 @@ class TransKun(torch.nn.Module):
             intervalsBatch.append(data["intervals"])
             velocityBatch.append(sum(data["velocity"], []))
             ofRefinedGTBatch.append(sum(data["endPointRefine"], []))
-
         intervalsBatch_flatten = sum(intervalsBatch, [])
-        assert len(intervalsBatch_flatten) == B * len(self.target_midi_pitch)
 
-        # then compare intervals and path
+        if all(len(sym_intervals) == 0 for sym_intervals in intervalsBatch_flatten):
+            return {
+                "nGT": 0,
+                "nEst": 0,
+                "nCorrect": 0,
+                "nGTFramewise": 0,
+                "nEstFramewise": 0,
+                "nCorrectFramewise": 0,
+                "seVelocityForced": 0.0,
+                "seOFForced": 0.0,
+            }
+        assert len(intervalsBatch_flatten) == B * len(self.target_midi_pitch)
         assert len(path) == len(intervalsBatch_flatten)
 
         # print(sum([len(p) for p in intervalsBatch_flatten]), "intervalsGT")
@@ -500,6 +509,13 @@ class TransKun(torch.nn.Module):
 
                 ctx_a_all.append(ctx_a)
                 ctx_b_all.append(ctx_b)
+
+        if len(ctx_a_all) == 0:
+            device = ctxBatch.device
+            dtype = ctxBatch.dtype
+            empty_ctx = torch.empty(0, ctxBatch.shape[-1], device=device, dtype=dtype)
+            empty_idx = torch.empty(0, dtype=torch.long, device=device)
+            return empty_ctx, empty_ctx, empty_idx, empty_idx
 
         ctx_a_all = torch.cat(ctx_a_all, dim=0)
         ctx_b_all = torch.cat(ctx_b_all, dim=0)
