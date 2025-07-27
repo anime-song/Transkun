@@ -58,6 +58,7 @@ def main():
         "--use_state_dict",
         action="store_true",
     )
+    argumentParser.add_argument("--audio_save_path", type=str, default=None)
 
     args = argumentParser.parse_args()
 
@@ -115,13 +116,22 @@ def main():
     outputMidi = writeMidi(notesEst)
     outputMidi.write(outPath)
 
+    stem_name_list = ["piano", "other"]
+    audio_save_path = args.audio_save_path
+    if audio_save_path is None:
+        audio_save_path = Path(audioPath).parent
+    else:
+        audio_save_path = Path(audio_save_path)
+    audio_file_name = Path(audioPath).stem
+    audio_save_path.mkdir(parents=True, exist_ok=True)
+
     for i in range(recon_audio.shape[0]):
         # recon_audio: (C, N, T)
         recon_np = recon_audio[:, i].transpose(0, 1).cpu().numpy()  # (T, C)
-        audio_path_obj = Path(audioPath)
-        write_wav_path = audio_path_obj.with_name(
-            f"{audio_path_obj.stem}_separated_{i}.wav"
+        write_wav_path = (
+            audio_save_path / f"{audio_file_name}_{stem_name_list[i]}{i}.wav"
         )
+
         sf.write(write_wav_path, recon_np, conf.fs, subtype="PCM_16")
 
 
