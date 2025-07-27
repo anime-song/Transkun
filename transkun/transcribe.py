@@ -3,22 +3,19 @@ import argparse
 from .Data import writeMidi
 import torch
 import moduleconf
-import numpy as np
 import soundfile as sf
 from pathlib import Path
-from .utils import computeParamSize
 from .model import TransKun
+import librosa
 
 
-def readAudio(path, normalize=True):
-    import pydub
+def read_audio(path: str, sampling_rate: int):
+    y, sr = librosa.load(path, sr=sampling_rate, mono=False)
 
-    audio = pydub.AudioSegment.from_mp3(path)
-    y = np.array(audio.get_array_of_samples())
-    y = y.reshape(-1, audio.channels)
-    if normalize:
-        y = np.float32(y) / 2**15
-    return audio.frame_rate, y
+    if y.ndim == 2:
+        y = y.T
+
+    return sr, y
 
 
 def main():
@@ -93,16 +90,7 @@ def main():
 
     torch.set_grad_enabled(False)
 
-    fs, audio = readAudio(audioPath)
-
-    if fs != model.fs:
-        import soxr
-
-        audio = soxr.resample(
-            audio,  # 1D(mono) or 2D(frames, channels) array input
-            fs,  # input samplerate
-            model.fs,  # target samplerate
-        )
+    audio = read_audio(audioPath, sampling_rate=model.fs)
 
     x = torch.from_numpy(audio).to(device)
 
@@ -128,9 +116,7 @@ def main():
     for i in range(recon_audio.shape[0]):
         # recon_audio: (C, N, T)
         recon_np = recon_audio[:, i].transpose(0, 1).cpu().numpy()  # (T, C)
-        write_wav_path = (
-            audio_save_path / f"{audio_file_name}_{stem_name_list[i]}{i}.wav"
-        )
+        write_wav_path = audio_save_path / f"{audio_file_name}_{stem_name_list[i]}.wav"
 
         sf.write(write_wav_path, recon_np, conf.fs, subtype="PCM_16")
 
