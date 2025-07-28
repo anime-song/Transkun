@@ -196,7 +196,9 @@ def train(workerId, filename, runSeed, args):
             logp, (loss_spec, loss_wmse) = model.log_prob(
                 audioSlices, notesBatch, target_audio=target_audio
             )
-            loss_recon = (loss_spec + loss_wmse) * loss_spec_weight
+            loss_recon = (
+                loss_spec + loss_wmse * model.loss_wmse_weight
+            ) * loss_spec_weight
             loss_seq = -logp.sum(-1).mean()
             loss = loss_seq + loss_recon
 

@@ -17,12 +17,12 @@ class ModelConfig:
         self.segmentSizeInSecond = 16
 
         self.hopSize = 1024
-        self.multi_stft_loss_hop_length = 256
         self.windowSize = 2048
         self.fs = 44100
         self.num_bands = 60
         self.num_channels = 2
         self.loss_spec_weight = 1.0
+        self.loss_wmse_weight = 0.1
 
         self.baseSize = 64
         self.nHead = 8
@@ -62,49 +62,48 @@ def _stft_l1(
     checkpoint で呼び出すため、すべての引数を Tensor にする。
     """
     # (B, T) -> 複素 STFT
-    spec_hat = torch.stft(
-        recon, n_fft, hop_length, win_length, window=window, return_complex=True
-    )
+    spec_hat = torch.stft(recon, n_fft, hop_length, win_length, window=window, return_complex=True)
     with torch.no_grad():  # 勾配不要なので保存しない
-        spec_ref = torch.stft(
-            target, n_fft, hop_length, win_length, window=window, return_complex=True
-        )
+        spec_ref = torch.stft(target, n_fft, hop_length, win_length, window=window, return_complex=True)
     return F.l1_loss(spec_hat, spec_ref)
 
 
 def multi_resolution_stft_loss(
     recon_audio: torch.Tensor,
     target_audio: torch.Tensor,
-    n_fft: int,
-    resolutions: list[int] = [4096, 2048, 1024, 512, 256],
-    hop_length: int = 147,
+    resolutions: list[int] = [32, 64, 128, 256, 512, 1024, 2048],
     window_fn=torch.hann_window,
     loss_weight: float = 1.0,
+    stem_weights: list[float] = None,
+    hop_divisor: int = 4,
 ) -> torch.Tensor:
     b, c, n, t = recon_audio.shape
+    stem_weights = torch.as_tensor(stem_weights, device=recon_audio.device, dtype=recon_audio.dtype)
+    weight_sum = stem_weights.sum()
     total_loss = recon_audio.new_tensor(0.0)
 
+    hop_list = [r // hop_divisor for r in resolutions]
     for stem in range(n):
+        w_stem = stem_weights[stem]
         for channel in range(c):
             recon = recon_audio[:, channel, stem].reshape(-1, t)  # (B, T)
             target = target_audio[:, channel, stem].reshape(-1, t)
 
-            for win_len in resolutions:
-                n_fft_sel = max(n_fft, win_len)
+            for win_len, hop_length in zip(resolutions, hop_list):
                 window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
 
                 loss_i = torch.utils.checkpoint.checkpoint(
                     _stft_l1,
                     recon,
                     target,
-                    torch.tensor(n_fft_sel),
+                    torch.tensor(win_len),
                     torch.tensor(hop_length),
                     torch.tensor(win_len),
                     window,
                     use_reentrant=False,
                 )
-                total_loss = total_loss + loss_i
-    return total_loss / n / c * loss_weight
+                total_loss = total_loss + w_stem * loss_i
+    return (total_loss / (c * weight_sum)) * loss_weight
 
 
 class TransKun(torch.nn.Module):
@@ -121,7 +120,8 @@ class TransKun(torch.nn.Module):
         self.num_channels = conf.num_channels
         self.n_fft = self.window_size
         self.num_stems = 2
-        self.multi_stft_loss_hop_length = conf.multi_stft_loss_hop_length
+        self.loss_wmse_weight = conf.loss_wmse_weight
+        self.stem_weights = [1.0, 0.3]
 
         self.segmentSizeInSecond = conf.segmentSizeInSecond
         self.segmentHopSizeInSecond = conf.segmentHopSizeInSecond
@@ -193,8 +193,7 @@ class TransKun(torch.nn.Module):
 
     def log_prob(self, inputs, notesBatch, target_audio=None):
         B = inputs.shape[0]
-        # [B, C, T]
-        inputs = inputs.transpose(-1, -2)
+        inputs = inputs.transpose(-1, -2)  # [B, C, T]
 
         device = inputs.device
         # target_audio: [B, T, N, C]
@@ -211,8 +210,8 @@ class TransKun(torch.nn.Module):
             loss_spec = multi_resolution_stft_loss(
                 recon_audio=recon_audio,
                 target_audio=target_audio,
-                n_fft=self.n_fft,
-                hop_length=self.multi_stft_loss_hop_length,
+                stem_weights=self.stem_weights,
+                hop_divisor=4,
             )
             log_wmse = LogWMSE(
                 audio_length=recon_audio.shape[-1] / self.fs,
@@ -261,9 +260,7 @@ class TransKun(torch.nn.Module):
                 scatterIdx_all,
             ) = self.fetchIntervalFeaturesBatch(ctxBatch, intervalsBatch)
 
-            attributeInput = torch.cat(
-                [ctx_a_all, ctx_b_all, ctx_a_all * ctx_b_all], dim=-1
-            )
+            attributeInput = torch.cat([ctx_a_all, ctx_b_all, ctx_a_all * ctx_b_all], dim=-1)
 
             # prepare groundtruth for velocity
 
@@ -276,25 +273,17 @@ class TransKun(torch.nn.Module):
 
             velocityBatch = torch.tensor(velocityBatch, dtype=torch.long, device=device)
 
-            logProbVelocity = torch.gather(
-                logitsVelocity, dim=-1, index=velocityBatch.unsqueeze(-1)
-            ).squeeze(-1)
+            logProbVelocity = torch.gather(logitsVelocity, dim=-1, index=velocityBatch.unsqueeze(-1)).squeeze(-1)
 
-            ofRefinedGTBatch = torch.tensor(
-                ofRefinedGTBatch, device=device, dtype=torch.float
-            )
-            ofPresenceGTBatch = torch.tensor(
-                ofPresenceGTBatch, device=device, dtype=torch.float
-            )
+            ofRefinedGTBatch = torch.tensor(ofRefinedGTBatch, device=device, dtype=torch.float)
+            ofPresenceGTBatch = torch.tensor(ofPresenceGTBatch, device=device, dtype=torch.float)
 
             # shift it to [0,1]
             # print("GT:", ofRefinedGTBatch)
 
             ofRefinedGTBatch = ofRefinedGTBatch * 0.99 + 0.5
 
-            ofValue, ofPresence = self.refinedOFPredictor(attributeInput).chunk(
-                2, dim=-1
-            )
+            ofValue, ofPresence = self.refinedOFPredictor(attributeInput).chunk(2, dim=-1)
 
             # ofValue = F.logsigmoid(ofValue)
 
@@ -309,9 +298,7 @@ class TransKun(torch.nn.Module):
             # scatter them back
             logProb = logProb.view(-1)
 
-            logProb = logProb.scatter_add(
-                -1, scatterIdx_all, logProbVelocity + logProbOF + logProbOFPresence
-            )
+            logProb = logProb.scatter_add(-1, scatterIdx_all, logProbVelocity + logProbOF + logProbOFPresence)
 
         logProb = logProb.view(B, -1)
 
@@ -392,18 +379,14 @@ class TransKun(torch.nn.Module):
 
         # print(sum([len(p) for p in intervalsBatch_flatten]), "intervalsGT")
 
-        statsAll = [
-            compareBracket(l1, l2) for l1, l2 in zip(path, intervalsBatch_flatten)
-        ]
+        statsAll = [compareBracket(l1, l2) for l1, l2 in zip(path, intervalsBatch_flatten)]
 
         nGT = sum([_[0] for _ in statsAll])
         nEst = sum([_[1] for _ in statsAll])
         nCorrect = sum([_[2] for _ in statsAll])
 
         # omit pedal
-        statsFramewiseAll = [
-            compareFramewise(l1, l2) for l1, l2 in zip(path, intervalsBatch_flatten)
-        ]
+        statsFramewiseAll = [compareFramewise(l1, l2) for l1, l2 in zip(path, intervalsBatch_flatten)]
 
         nGTFramewise = sum([_[0] for _ in statsFramewiseAll])
         nEstFramewise = sum([_[1] for _ in statsFramewiseAll])
@@ -445,9 +428,7 @@ class TransKun(torch.nn.Module):
         velocityBatch = torch.tensor(velocityBatch, dtype=torch.long, device=device)
 
         ofRefinedGTBatch = sum(ofRefinedGTBatch, [])
-        ofRefinedGTBatch = torch.tensor(
-            ofRefinedGTBatch, device=device, dtype=torch.float
-        )
+        ofRefinedGTBatch = torch.tensor(ofRefinedGTBatch, device=device, dtype=torch.float)
         # compare p velocity with ofValue
 
         # ofValue-of
@@ -482,28 +463,16 @@ class TransKun(torch.nn.Module):
         for idx, curIntervals in enumerate(intervalsBatch):
             nIntervals = len(sum(curIntervals, []))
             if nIntervals > 0:
-                symIdx = torch.tensor(
-                    listToIdx(curIntervals), dtype=torch.long, device=device
-                )
+                symIdx = torch.tensor(listToIdx(curIntervals), dtype=torch.long, device=device)
                 symIdx_all.append(symIdx)
 
                 scatterIdx_all.append(idx * len(self.target_midi_pitch) + symIdx)
 
-                indices = torch.tensor(
-                    sum(curIntervals, []), dtype=torch.long, device=device
-                )
+                indices = torch.tensor(sum(curIntervals, []), dtype=torch.long, device=device)
                 # print(len(symIdx), len(indices[:,0]))
 
-                ctx_a = (
-                    ctxBatch[idx]
-                    .flatten(0, 1)
-                    .index_select(dim=0, index=indices[:, 0] + symIdx * T)
-                )
-                ctx_b = (
-                    ctxBatch[idx]
-                    .flatten(0, 1)
-                    .index_select(dim=0, index=indices[:, 1] + symIdx * T)
-                )
+                ctx_a = ctxBatch[idx].flatten(0, 1).index_select(dim=0, index=indices[:, 0] + symIdx * T)
+                ctx_b = ctxBatch[idx].flatten(0, 1).index_select(dim=0, index=indices[:, 1] + symIdx * T)
 
                 ctx_a_all.append(ctx_a)
                 ctx_b_all.append(ctx_b)
@@ -725,9 +694,7 @@ class TransKun(torch.nn.Module):
 
         padTimeBegin = segmentSizeInSecond - stepInSecond
 
-        x = F.pad(
-            x, (math.ceil(padTimeBegin * self.fs), math.ceil(self.fs * (padTimeBegin)))
-        )
+        x = F.pad(x, (math.ceil(padTimeBegin * self.fs), math.ceil(self.fs * (padTimeBegin))))
 
         nSample = x.shape[-1]
 
