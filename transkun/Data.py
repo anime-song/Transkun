@@ -11,7 +11,7 @@ import torch
 import random
 from collections import defaultdict
 import csv
-from typing import Tuple
+from typing import Tuple, Optional
 
 
 # a local definition of the midi note object
@@ -266,9 +266,7 @@ def createDatasetMaestroCSV(datasetPath, datasetMetaCSVPath, extendSustainPedal=
             inst = midiFile.instruments[0]
             if len(midiFile.instruments) > 1:
                 raise Exception("contains more than one track")
-            events = parseEventAll(
-                inst.notes, inst.control_changes, extendSustainPedal=extendSustainPedal
-            )
+            events = parseEventAll(inst.notes, inst.control_changes, extendSustainPedal=extendSustainPedal)
 
             with wave.open(audioPath) as f:
                 fs = f.getframerate()
@@ -342,9 +340,7 @@ def writeMidi(notes, resolution=960):
 
     for note in notes:
         if note.pitch > 0:
-            note = pretty_midi.Note(
-                start=note.start, end=note.end, pitch=note.pitch, velocity=note.velocity
-            )
+            note = pretty_midi.Note(start=note.start, end=note.end, pitch=note.pitch, velocity=note.velocity)
             piano.notes.append(note)
         else:
             cc_on = pretty_midi.ControlChange(-note.pitch, note.velocity, note.start)
@@ -378,9 +374,7 @@ class DatasetMaestro:
                 self.durations.append(float(sample["duration"]))
                 # メモリ節約のため sample は即破棄
 
-        print(
-            f"Found {len(self.sample_offsets)} pieces in {os.path.basename(self.datasetAnnotationPicklePath)}"
-        )
+        print(f"Found {len(self.sample_offsets)} pieces in {os.path.basename(self.datasetAnnotationPicklePath)}")
         totalTime = sum(self.durations)
         print("totalDuration: ", totalTime)
 
@@ -434,9 +428,7 @@ class DatasetMaestro:
         if end < 0 and begin < 0:
             noteIndices = []
         else:
-            noteIndices = querySingleInterval(
-                max(begin, 0.0), max(end, 0.0), piece["index"]
-            )
+            noteIndices = querySingleInterval(max(begin, 0.0), max(end, 0.0), piece["index"])
 
         notes = [piece["notes"][int(_)] for _ in noteIndices]
 
@@ -465,9 +457,7 @@ class DatasetMaestro:
         audioSlice, fs = readAudioSlice(audioPath, begin, end, audioNormalize)
 
         other_path = os.path.join(self.datasetPath, piece["other_filename"])
-        other_slice, fs = readAudioSlice(
-            other_path, other_begin, other_end, audioNormalize
-        )
+        other_slice, fs = readAudioSlice(other_path, other_begin, other_end, audioNormalize)
 
         return notes, audioSlice, other_slice, fs
 
@@ -491,6 +481,7 @@ class AugmentatorAudiomentations:
             SevenBandParametricEQ,
             PolarityInversion,
             RoomSimulator,
+            Gain,
         )
 
         transformList = [
@@ -502,6 +493,7 @@ class AugmentatorAudiomentations:
                 max_order=3,
                 p=0.5,
             ),
+            Gain(min_gain_db=-6, max_gain_db=0, p=0.5),
         ]
 
         self.transform = Compose(transformList)
@@ -509,9 +501,7 @@ class AugmentatorAudiomentations:
         if convIRFolder is not None:
             irPath = Path(convIRFolder)
             fileList = list(irPath.glob(os.path.join("**", "*.wav")))
-            self.reverb = ApplyImpulseResponse(
-                fileList, p=0.5, lru_cache_size=2000, leave_length_unchanged=True
-            )
+            self.reverb = ApplyImpulseResponse(fileList, p=0.5, lru_cache_size=2000, leave_length_unchanged=True)
             print("aug: convIR enabled")
         else:
             self.reverb = None
@@ -541,9 +531,7 @@ class AugmentatorAudiomentations:
 
             print("aug: noise enabled")
 
-        transformNoiseList.append(
-            AddGaussianSNR(min_snr_db=snrRange[0], max_snr_db=snrRange[1], p=0.1)
-        )
+        transformNoiseList.append(AddGaussianSNR(min_snr_db=snrRange[0], max_snr_db=snrRange[1], p=0.1))
 
         self.transformNoise = Compose(transformNoiseList)
         self.sampleRate = sampleRate
@@ -695,9 +683,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         other_begin = None
         if random.random() < 0.5:
             # ランダムで他の曲のミックスを合成する
-            other_idx, other_begin, other_end = self.chunksAll[
-                random.randint(0, len(self.chunksAll) - 1)
-            ]
+            other_idx, other_begin, other_end = self.chunksAll[random.randint(0, len(self.chunksAll) - 1)]
 
         notes, target_audio, other_slice, fs = self.dataset.fetchData(
             idx,
@@ -716,9 +702,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         mixture = target_audio
         if other_slice is not None:
             random_snr_db = np.random.uniform(-6.0, 6.0)
-            mixture, target_audio, other_audio = mix_at_snr(
-                target_audio, other_slice, random_snr_db
-            )
+            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_snr_db)
             target_audio = np.stack([target_audio, other_audio], axis=-2)  # [T, N, C]
 
         sample = {
