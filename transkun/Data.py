@@ -834,19 +834,13 @@ def prepareIntervalsNoQuantize(notes, targetPitch):
     return result
 
 
-def prepareIntervals(notes, hopSizeInSecond, targetPitch):
+def prepareIntervals(notes, hopSizeInSecond, targetPitch, max_frame: Optional[int] = None):
     validateNotes(notes)
-    # print("hopSizeInSecond:", hopSizeInSecond)
 
-    # tracks of intervals indexed by pitch
-    # for pedal event, use a negative number
     tracks = defaultdict(list)
-
-    # split notes into tracks and then snap to the grid
     for n in notes:
         tracks[n.pitch].append(n)
 
-    # process pitch by pitch
     intervals_all = []
     velocity_all = []
     endPointRefine_all = []
@@ -857,31 +851,29 @@ def prepareIntervals(notes, hopSizeInSecond, targetPitch):
         endPointRefine = []
         endPointPresence = []
         velocity = []
-        # print("pitch:", p)
-        for n in tracks[p]:
-            # print(n)
-            assert n.start >= 0, n.start
-            assert n.end >= 0, n.end
 
+        for n in tracks[p]:
             start_quantized = int(round(n.start / hopSizeInSecond))
             end_quantized = int(round(n.end / hopSizeInSecond))
 
+            if max_frame is not None:
+                if start_quantized >= max_frame:
+                    continue
+                end_quantized = min(end_quantized, max_frame - 1)
+                if end_quantized < start_quantized:
+                    end_quantized = start_quantized
+
             start_refine = n.start / hopSizeInSecond - start_quantized
             end_refine = n.end / hopSizeInSecond - end_quantized
-
             curVelocity = n.velocity
 
             tmp = (start_quantized, end_quantized)
             tmpPresence = (n.hasOnset, n.hasOffset)
-            # print(n)
 
             # check if two consecutive notes can be seaprated by interval representation
             if len(intervals) > 0 and (
                 start_quantized < intervals[-1][1]
-                or (
-                    end_quantized == intervals[-1][1]
-                    and intervals[-1][0] == start_quantized
-                )
+                or (end_quantized == intervals[-1][1] and intervals[-1][0] == start_quantized)
             ):
                 # raise Exception("two notes quantized in the same frame that cannot be separated: {}, {}".format(tmp, intervals[-1]))
                 print(
@@ -890,12 +882,6 @@ def prepareIntervals(notes, hopSizeInSecond, targetPitch):
                     )
                 )
 
-                # asd
-                # print(n)
-                # print(intervals[-1])
-                # print(start_quantized, end_quantized)
-
-                # two consecutive note on event, treat as the same note, use the same velocity
                 intervals[-1] = (intervals[-1][0], end_quantized)
                 endPointRefine[-1] = (endPointRefine[-1][0], end_refine)
                 endPointPresence[-1] = (endPointPresence[-1][0], n.hasOffset)
@@ -904,10 +890,6 @@ def prepareIntervals(notes, hopSizeInSecond, targetPitch):
                 endPointRefine.append((start_refine, end_refine))
                 endPointPresence.append(tmpPresence)
                 velocity.append(curVelocity)
-
-        # print(intervals)
-        # print(endPointRefine)
-        # print(velocity)
 
         intervals_all.append(intervals)
         endPointRefine_all.append(endPointRefine)

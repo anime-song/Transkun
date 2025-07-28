@@ -230,10 +230,9 @@ class TransKun(torch.nn.Module):
         velocityBatch = []
         ofRefinedGTBatch = []
         ofPresenceGTBatch = []
+        T = inputs.shape[-1] // self.hop_size + 1
         for notes in notesBatch:
-            data = prepareIntervals(
-                notes, self.hop_size / self.fs, self.target_midi_pitch
-            )
+            data = prepareIntervals(notes, self.hop_size / self.fs, self.target_midi_pitch, max_frame=T)
             intervalsBatch.append(data["intervals"])
             velocityBatch.append(sum(data["velocity"], []))
             ofRefinedGTBatch.append(sum(data["endPointRefine"], []))
@@ -369,10 +368,9 @@ class TransKun(torch.nn.Module):
         intervalsBatch = []
         velocityBatch = []
         ofRefinedGTBatch = []
+        T = inputs.shape[-1] // self.hop_size + 1
         for notes in notes_batch:
-            data = prepareIntervals(
-                notes, self.hop_size / self.fs, self.target_midi_pitch
-            )
+            data = prepareIntervals(notes, self.hop_size / self.fs, self.target_midi_pitch, max_frame=T)
             intervalsBatch.append(data["intervals"])
             velocityBatch.append(sum(data["velocity"], []))
             ofRefinedGTBatch.append(sum(data["endPointRefine"], []))
