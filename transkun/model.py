@@ -106,6 +106,10 @@ def multi_resolution_stft_loss(
     return (total_loss / (c * weight_sum)) * loss_weight
 
 
+def bounded_logits(raw: torch.Tensor, limit: float = 6.0) -> torch.Tensor:
+    return limit * torch.tanh(raw / limit)
+
+
 class TransKun(torch.nn.Module):
     Config = ModelConfig
 
@@ -125,6 +129,7 @@ class TransKun(torch.nn.Module):
 
         self.segmentSizeInSecond = conf.segmentSizeInSecond
         self.segmentHopSizeInSecond = conf.segmentHopSizeInSecond
+        self.refinedOFPredictor_penalty = 1e-4
 
         self.target_midi_pitch = [-64, -67] + list(range(21, 108 + 1))
 
@@ -252,6 +257,7 @@ class TransKun(torch.nn.Module):
 
         nIntervalsAll = sum([len(_) for _ in intervalsBatch_flatten])
 
+        penalty = torch.tensor(0.0, device=device)
         if nIntervalsAll > 0:
             (
                 ctx_a_all,
@@ -283,11 +289,10 @@ class TransKun(torch.nn.Module):
 
             ofRefinedGTBatch = ofRefinedGTBatch * 0.99 + 0.5
 
-            ofValue, ofPresence = self.refinedOFPredictor(attributeInput).chunk(2, dim=-1)
+            raw_of, ofPresence = self.refinedOFPredictor(attributeInput).chunk(2, dim=-1)
 
-            # ofValue = F.logsigmoid(ofValue)
-
-            ofDist = torch.distributions.ContinuousBernoulli(logits=ofValue)
+            of_logits = bounded_logits(raw_of)
+            ofDist = torch.distributions.ContinuousBernoulli(logits=of_logits)
 
             logProbOF = ofDist.log_prob(ofRefinedGTBatch).sum(-1)
 
@@ -297,12 +302,13 @@ class TransKun(torch.nn.Module):
 
             # scatter them back
             logProb = logProb.view(-1)
-
             logProb = logProb.scatter_add(-1, scatterIdx_all, logProbVelocity + logProbOF + logProbOFPresence)
+
+            penalty = (raw_of.pow(2).mean()) * self.refinedOFPredictor_penalty
 
         logProb = logProb.view(B, -1)
 
-        return logProb, (loss_spec, loss_wmse)
+        return logProb, (loss_spec, loss_wmse, penalty)
 
     def compute_stats_mireval(self, inputs, notes_batch):
         B = inputs.shape[0]
@@ -417,12 +423,13 @@ class TransKun(torch.nn.Module):
         w = torch.arange(128, device=device)
         velocity = (pVelocity * w).sum(-1)
 
-        ofValue, _ = self.refinedOFPredictor(attributeInput).chunk(2, dim=-1)
-        # ofValue = torch.sigmoid(ofValue)-0.5
-        ofDist = torch.distributions.ContinuousBernoulli(logits=ofValue)
+        raw_of, _ = self.refinedOFPredictor(attributeInput).chunk(2, dim=-1)
 
-        ofValue = (ofDist.mean - 0.5) / 0.99
-        ofValue = torch.clamp(ofValue, -0.5, 0.5)
+        of_logits = bounded_logits(raw_of)
+        ofDist = torch.distributions.ContinuousBernoulli(logits=of_logits)
+
+        of_value = (ofDist.mean - 0.5) / 0.99
+        of_value = torch.clamp(of_value, -0.5, 0.5)
 
         velocityBatch = sum(velocityBatch, [])
         velocityBatch = torch.tensor(velocityBatch, dtype=torch.long, device=device)
@@ -432,7 +439,7 @@ class TransKun(torch.nn.Module):
         # compare p velocity with ofValue
 
         # ofValue-of
-        seOF = (ofValue - ofRefinedGTBatch).pow(2).sum()
+        seOF = (of_value - ofRefinedGTBatch).pow(2).sum()
         seVelocity = (velocity - velocityBatch).pow(2).sum()
 
         # print(ofValue[0], ofRefinedGTBatch[0])
@@ -595,12 +602,13 @@ class TransKun(torch.nn.Module):
         else:
             raise Exception("Unrecognized criterion: {}".format(velocityCriteron))
 
-        ofValue, ofPresence = self.refinedOFPredictor(attributeInput).chunk(2, dim=-1)
-        # ofValue = torch.sigmoid(ofValue)-0.5
-        ofDist = torch.distributions.ContinuousBernoulli(logits=ofValue)
+        raw_of, ofPresence = self.refinedOFPredictor(attributeInput).chunk(2, dim=-1)
 
-        ofValue = (ofDist.mean - 0.5) / 0.99
-        ofValue = torch.clamp(ofValue, -0.5, 0.5)
+        of_logits = bounded_logits(raw_of)
+        ofDist = torch.distributions.ContinuousBernoulli(logits=of_logits)
+
+        of_value = (ofDist.mean - 0.5) / 0.99
+        of_value = torch.clamp(of_value, -0.5, 0.5)
 
         ofPresence = ofPresence > 0
 
@@ -612,10 +620,10 @@ class TransKun(torch.nn.Module):
         # parse the list of path to (begin, end, midipitch, velocity)
 
         velocity = velocity.cpu().detach().tolist()
-        ofValue = ofValue.cpu().detach().tolist()
+        of_value = of_value.cpu().detach().tolist()
         ofPresence = ofPresence.cpu().detach().tolist()
 
-        assert len(velocity) == len(ofValue)
+        assert len(velocity) == len(of_value)
         assert len(velocity) == nIntervalsAll
 
         nCount = 0
@@ -640,7 +648,7 @@ class TransKun(torch.nn.Module):
 
                     curVelocity = velocity[nCount]
 
-                    curOffset = ofValue[nCount]
+                    curOffset = of_value[nCount]
                     start = (aInterval[0] + curOffset[0]) * frameDur
                     end = (aInterval[1] + curOffset[1]) * frameDur
 

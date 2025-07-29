@@ -4,6 +4,7 @@ import torch_optimizer as optim
 import torch.nn as nn
 import numpy as np
 import copy
+from .transformer import RMSNorm
 
 
 class MovingBuffer:
@@ -24,9 +25,7 @@ class MovingBuffer:
 def checkNoneGradient(model):
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is None:
-            print(
-                "Warning: detected parameter with no gradient that requires gradient:"
-            )
+            print("Warning: detected parameter with no gradient that requires gradient:")
             print(param)
             print(param.shape)
             print(name)
@@ -59,9 +58,7 @@ def load_state_dict_tolerant(model, state_dict):
     model_dict = model.state_dict()
     # 1. filter out unnecessary keys
     pretrained_dict = {
-        k: v
-        for k, v in state_dict.items()
-        if (k in model_dict) and (model_dict[k].shape == state_dict[k].shape)
+        k: v for k, v in state_dict.items() if (k in model_dict) and (model_dict[k].shape == state_dict[k].shape)
     }
     # 2. overwrite entries in the existing state dict
     model_dict.update(pretrained_dict)
@@ -69,9 +66,7 @@ def load_state_dict_tolerant(model, state_dict):
     model.load_state_dict(model_dict)
 
 
-def save_checkpoint(
-    filename, epoch, nIter, model, lossTracker, best_state_dict, optimizer, lrScheduler
-):
+def save_checkpoint(filename, epoch, nIter, model, lossTracker, best_state_dict, optimizer, lrScheduler):
     checkpoint = {
         #'conf':model.conf.__dict__,
         "state_dict": model.state_dict(),
@@ -99,7 +94,7 @@ def getOptimizerGroup(model):
 
     noDecay = []
     for name, module in model.named_modules():
-        if isinstance(module, nn.GroupNorm) or isinstance(module, nn.LayerNorm):
+        if isinstance(module, nn.GroupNorm) or isinstance(module, nn.LayerNorm) or isinstance(module, RMSNorm):
             noDecay.extend(list(module.parameters()))
         else:
             noDecay.extend([p for n, p in module.named_parameters() if "bias" in n])
@@ -258,9 +253,7 @@ def doValidation(model, dataset, device):
     with torch.no_grad():
         for idx, batch in enumerate(dataset):
             notesBatch = [sample["notes"] for sample in batch]
-            audioSlices = torch.stack(
-                [torch.from_numpy(sample["audioSlice"]) for sample in batch], dim=0
-            ).to(device)
+            audioSlices = torch.stack([torch.from_numpy(sample["audioSlice"]) for sample in batch], dim=0).to(device)
 
             result = computeMetrics(model, audioSlices, notesBatch)
             resultAll.append(result)

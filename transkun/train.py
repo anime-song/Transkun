@@ -19,21 +19,13 @@ import moduleconf
 def check_gradients(model) -> None:
     # ------- 検証 -------
     params_with_grad = [p for p in model.parameters() if p.grad is not None]
-    assert len(params_with_grad) == sum(
-        1 for _ in model.parameters()
-    ), "一部 grad が None"
-    assert all(
-        torch.isfinite(p.grad).all() for p in params_with_grad
-    ), "grad に Inf / NaN"
+    assert len(params_with_grad) == sum(1 for _ in model.parameters()), "一部 grad が None"
+    assert all(torch.isfinite(p.grad).all() for p in params_with_grad), "grad に Inf / NaN"
     print(f"✓gradients OK")
 
 
 def train(workerId, filename, runSeed, args):
-    device = torch.device(
-        "cuda:" + str(workerId % torch.cuda.device_count())
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    device = torch.device("cuda:" + str(workerId % torch.cuda.device_count()) if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
     random.seed(workerId + int(time.time()))
     # torch.autograd.set_detect_anomaly(True)
@@ -193,14 +185,10 @@ def train(workerId, filename, runSeed, args):
             target_audio = batch["target_audio"].to(device)
             audioLength = audioSlices.shape[1] / model.conf.fs
 
-            logp, (loss_spec, loss_wmse) = model.log_prob(
-                audioSlices, notesBatch, target_audio=target_audio
-            )
-            loss_recon = (
-                loss_spec + loss_wmse * model.loss_wmse_weight
-            ) * loss_spec_weight
+            logp, (loss_spec, loss_wmse, penalty) = model.log_prob(audioSlices, notesBatch, target_audio=target_audio)
+            loss_recon = (loss_spec + loss_wmse * model.loss_wmse_weight) * loss_spec_weight
             loss_seq = -logp.sum(-1).mean()
-            loss = loss_seq + loss_recon
+            loss = loss_seq + loss_recon + penalty
 
             (loss / 50).backward()
 
@@ -276,11 +264,7 @@ def train(workerId, filename, runSeed, args):
                     else:
                         recall = num_correct / num_ground_truth
                     f1 = 2 * precision * recall / (precision + recall)
-                    print(
-                        "nGT:{} nEst:{} nCorrect:{}".format(
-                            num_ground_truth, num_estimated, num_correct
-                        )
-                    )
+                    print("nGT:{} nEst:{} nCorrect:{}".format(num_ground_truth, num_estimated, num_correct))
 
                     writer.add_scalar(f"Loss/train_f1", f1, globalStep)
                     writer.add_scalar(f"Loss/train_precision", precision, globalStep)
@@ -297,33 +281,18 @@ def train(workerId, filename, runSeed, args):
                         recallFrame = 0.0
                     else:
                         recallFrame = nCorrectFramewise / nGTFramewise
-                    f1Frame = (
-                        2
-                        * precisionFrame
-                        * recallFrame
-                        / (precisionFrame + recallFrame)
-                    )
+                    f1Frame = 2 * precisionFrame * recallFrame / (precisionFrame + recallFrame)
 
                     mseVelocity = totalSEVelocity.item() / num_ground_truth
                     mseOF = totalSEOF.item() / num_ground_truth
 
                     writer.add_scalar(f"Loss/train_f1_frame", f1Frame, globalStep)
-                    writer.add_scalar(
-                        f"Loss/train_precision_frame", precisionFrame, globalStep
-                    )
-                    writer.add_scalar(
-                        f"Loss/train_recall_frame", recallFrame, globalStep
-                    )
-                    writer.add_scalar(
-                        f"Loss/train_mse_velocity", mseVelocity, globalStep
-                    )
+                    writer.add_scalar(f"Loss/train_precision_frame", precisionFrame, globalStep)
+                    writer.add_scalar(f"Loss/train_recall_frame", recallFrame, globalStep)
+                    writer.add_scalar(f"Loss/train_mse_velocity", mseVelocity, globalStep)
                     writer.add_scalar(f"Loss/train_mse_OF", mseOF, globalStep)
                     print("f1:{} precision:{} recall:{}".format(f1, precision, recall))
-                    print(
-                        "f1Frame:{} precisionFrame:{} recallFrame:{}".format(
-                            f1Frame, precisionFrame, recallFrame
-                        )
-                    )
+                    print("f1Frame:{} precisionFrame:{} recallFrame:{}".format(f1Frame, precisionFrame, recallFrame))
                     print("mseVelocity:{} mseOF:{}".format(mseVelocity, mseOF))
 
                 if math.isnan(loss.item()):
@@ -372,7 +341,6 @@ def train(workerId, filename, runSeed, args):
         nll = valResult["meanNLL"]
         f1 = valResult["f1"]
 
-        # lrScheduler.step(nll)
         torch.cuda.empty_cache()
 
         if workerId == 0:
@@ -419,9 +387,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_lr", default=5e-4, type=float)
     parser.add_argument("--weight_decay", default=1e-4, type=float)
     parser.add_argument("--nIter", default=500000, type=int)
-    parser.add_argument(
-        "--modelConf", required=True, help="the path to the model conf file"
-    )
+    parser.add_argument("--modelConf", required=True, help="the path to the model conf file")
     parser.add_argument("--augment", action="store_true", help="do data augmentation")
     parser.add_argument("--noiseFolder", required=False)
     parser.add_argument("--irFolder", required=False)
