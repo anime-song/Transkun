@@ -27,9 +27,7 @@ class ScaledInnerProductIntervalScorer(nn.Module):
 
         if not withScoreEps:
             self.map = nn.Sequential(
-                nn.Linear(
-                    size, 2 * size * expansionFactor + 1
-                ),  # only inner product plus diagonal
+                nn.Linear(size, 2 * size * expansionFactor + 1),  # only inner product plus diagonal
             )
         else:
             self.map = nn.Sequential(
@@ -99,9 +97,7 @@ def build_mel_band_indices(
     return [np.where(mask[b])[0].astype(np.int32) for b in range(n_bands)]
 
 
-def build_band_indices(
-    sample_rate: int = 44_100, n_fft: int = 2_048
-) -> Tuple[np.ndarray, List[np.ndarray]]:
+def build_band_indices(sample_rate: int = 44_100, n_fft: int = 2_048) -> Tuple[np.ndarray, List[np.ndarray]]:
     """
     BSRoformer 用バンド分割 (各バンドの bin 数が必ず閾値以上)。
 
@@ -331,13 +327,9 @@ class Backbone(nn.Module):
         self.num_stems = num_stems
 
         if band_split_type == "bs":
-            _, self.band_indices = build_band_indices(
-                sample_rate=sampling_rate, n_fft=n_fft
-            )
+            _, self.band_indices = build_band_indices(sample_rate=sampling_rate, n_fft=n_fft)
         elif band_split_type == "mel":
-            self.band_indices = build_mel_band_indices(
-                sampling_rate=sampling_rate, n_fft=n_fft, n_bands=n_bands
-            )
+            self.band_indices = build_mel_band_indices(sampling_rate=sampling_rate, n_fft=n_fft, n_bands=n_bands)
         else:
             raise NotImplementedError("サポートしていない band_split_type です")
 
@@ -348,7 +340,35 @@ class Backbone(nn.Module):
             num_channels=self.num_channels,
         )
 
-        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size)
+        self.down_conv = nn.Sequential(
+            nn.ConstantPad2d((0, 0, 4, 3), value=0.0),
+            nn.Conv2d(hidden_size, hidden_size * 2, kernel_size=3, padding=1, stride=(2, 1)),
+            nn.GroupNorm(4, hidden_size * 2),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_size * 2,
+                hidden_size * 2,
+                kernel_size=3,
+                padding=1,
+                stride=(2, 1),
+            ),
+            nn.GroupNorm(4, hidden_size * 2),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_size * 2,
+                hidden_size * 2,
+                kernel_size=3,
+                padding=1,
+                stride=(2, 1),
+            ),
+            nn.GroupNorm(4, hidden_size * 2),
+            nn.GELU(),
+            nn.Conv2d(hidden_size * 2, hidden_size * 2, kernel_size=3, padding=1),
+            nn.GroupNorm(4, hidden_size * 2),
+        )
+        self.up_conv = nn.ConvTranspose1d(hidden_size * 2, hidden_size, kernel_size=8, stride=8)
+
+        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size * 2)
         self.register_buffer(
             "pitch_ids",
             torch.arange(self.num_pitches, dtype=torch.long),
@@ -357,8 +377,8 @@ class Backbone(nn.Module):
         self.encoder_layers = nn.ModuleList(
             [
                 BandSplitRoformerLayer(
-                    input_size=hidden_size,
-                    hidden_size=hidden_size,
+                    input_size=hidden_size * 2,
+                    hidden_size=hidden_size * 2,
                     num_heads=num_heads,
                     ffn_hidden_size_factor=ffn_hidden_size_factor,
                     dropout=dropout,
@@ -392,9 +412,7 @@ class Backbone(nn.Module):
             ]
         )
 
-        self.last_proj = nn.Linear(
-            self.hidden_size, self.hidden_size * scoring_expansion_factor
-        )
+        self.last_proj = nn.Linear(self.hidden_size, self.hidden_size * scoring_expansion_factor)
 
     def to_spectrogram(self, inputs: torch.Tensor) -> torch.Tensor:
         # (B, C, T)
@@ -404,15 +422,11 @@ class Backbone(nn.Module):
             n_fft=self.n_fft,
             hop_length=self.hop_size,
             win_length=self.window_size,
-            window=torch.hann_window(
-                self.window_size, device=inputs.device, dtype=inputs.dtype
-            ),
+            window=torch.hann_window(self.window_size, device=inputs.device, dtype=inputs.dtype),
             center=True,
             return_complex=True,
         )
-        spectrogram = einops.rearrange(
-            spectrogram, "(b c) f t -> b c f t", c=self.num_channels
-        )
+        spectrogram = einops.rearrange(spectrogram, "(b c) f t -> b c f t", c=self.num_channels)
         spectrogram_complex = spectrogram  # [B, C, F, T]
 
         spectrogram = torch.view_as_real(spectrogram)
@@ -429,9 +443,7 @@ class Backbone(nn.Module):
     ) -> torch.Tensor:
         # mask: [B, C, N, F, T]
         separated_spectrogram = original_spec_complex[:, :, None] * mask
-        separated_spectrogram = einops.rearrange(
-            separated_spectrogram, "b c n f t -> (b c n) f t"
-        )
+        separated_spectrogram = einops.rearrange(separated_spectrogram, "b c n f t -> (b c n) f t")
         recon_audio = torch.istft(
             separated_spectrogram,
             n_fft=self.window_size,
@@ -442,9 +454,7 @@ class Backbone(nn.Module):
             return_complex=False,
             length=original_length,
         )  # [B*C, T]
-        recon_audio = einops.rearrange(
-            recon_audio, "(b c n) t -> b c n t", c=self.num_channels, n=self.num_stems
-        )
+        recon_audio = einops.rearrange(recon_audio, "(b c n) t -> b c n t", c=self.num_channels, n=self.num_stems)
         return recon_audio
 
     def forward(self, x):
@@ -458,11 +468,15 @@ class Backbone(nn.Module):
         x, original_spec_complex = self.to_spectrogram(x)  # x: [B, C*S, T, F]
 
         x = einops.rearrange(x, "b c t f -> b t c f")
+        original_time_steps = x.shape[1]
 
         # 勾配が流れない問題に対処
-        x = checkpoint(
-            self.band_split, x, use_reentrant=False
-        )  # (B, T, K, hidden_size)
+        x = checkpoint(self.band_split, x, use_reentrant=False)  # (B, T, K, hidden_size)
+
+        # ダウンサンプリング
+        x = x.permute(0, 3, 1, 2)  # (B, hidden_size, T, K)
+        x = self.down_conv(x)
+        x = x.permute(0, 2, 3, 1)  # (B, downT, K, hidden_size*4)
 
         # バンド軸にピッチクエリを追加
         B, T, _, _ = x.shape
@@ -473,15 +487,17 @@ class Backbone(nn.Module):
             x = checkpoint(layer, x, use_reentrant=False)
         # x: [B, T, K+E, D]
 
+        # アップサンプリング
+        x = einops.rearrange(x, "b t ke d -> (b ke) d t")
+        x = self.up_conv(x)
+        x = einops.rearrange(x, "(b ke) d t -> b t ke d", ke=self.num_bands + self.num_pitches)
+        x = x[:, :original_time_steps]
+
         # 音源分離マスク
         mask_list = []
         for mask_estimator in self.mask_estimators:
-            pred_mask = checkpoint(
-                mask_estimator, x[:, :, : self.num_bands], use_reentrant=False
-            )  # [B, T, C*S, F]
-            pred_mask = einops.rearrange(
-                pred_mask, "b t (c s) f -> b t c f s", s=2
-            ).contiguous()
+            pred_mask = checkpoint(mask_estimator, x[:, :, : self.num_bands], use_reentrant=False)  # [B, T, C*S, F]
+            pred_mask = einops.rearrange(pred_mask, "b t (c s) f -> b t c f s", s=2).contiguous()
             pred_mask = torch.view_as_complex(pred_mask)  # [B, T, C, F]
             mask_list.append(pred_mask)
 
@@ -490,12 +506,8 @@ class Backbone(nn.Module):
             # 周波数ビンで重なる部分を加算する
             B, T, C, N, F_concat = mask_all.shape
             F_total = self.n_fft // 2 + 1
-            mask_sum = torch.zeros(
-                (B, T, C, N, F_total), dtype=mask_all.dtype, device=mask_all.device
-            )
-            freq_idx = self.freq_indices.view(1, 1, 1, 1, -1).expand(
-                B, T, C, N, -1
-            )  # [B, T, C, N, F_concat]
+            mask_sum = torch.zeros((B, T, C, N, F_total), dtype=mask_all.dtype, device=mask_all.device)
+            freq_idx = self.freq_indices.view(1, 1, 1, 1, -1).expand(B, T, C, N, -1)  # [B, T, C, N, F_concat]
             mask_sum.scatter_add_(
                 dim=-1,
                 index=freq_idx,
