@@ -7,7 +7,6 @@ from .utils import *
 from .Evaluation import *
 from .backbone import Backbone, ScaledInnerProductIntervalScorer
 from collections import defaultdict
-from torch_log_wmse import LogWMSE
 from . import CRF
 
 
@@ -19,14 +18,11 @@ class ModelConfig:
         self.hopSize = 1024
         self.windowSize = 2048
         self.fs = 44100
-        self.num_bands = 60
         self.num_channels = 2
-        self.loss_spec_weight = 1.0
-        self.loss_wmse_weight = 0.1
 
         self.baseSize = 64
         self.nHead = 8
-        self.band_split_type = "bs"
+        self.num_mels = 229
 
         self.nLayers = 6
         self.hiddenFactor = 4
@@ -49,63 +45,6 @@ class ModelConfig:
 Config = ModelConfig
 
 
-def _stft_l1(
-    recon: torch.Tensor,
-    target: torch.Tensor,
-    n_fft: int,
-    hop_length: int,
-    win_length: int,
-    window: torch.Tensor,
-) -> torch.Tensor:
-    """
-    1 解像度分の L1 損失だけ返す小さな関数。
-    checkpoint で呼び出すため、すべての引数を Tensor にする。
-    """
-    # (B, T) -> 複素 STFT
-    spec_hat = torch.stft(recon, n_fft, hop_length, win_length, window=window, return_complex=True)
-    with torch.no_grad():  # 勾配不要なので保存しない
-        spec_ref = torch.stft(target, n_fft, hop_length, win_length, window=window, return_complex=True)
-    return F.l1_loss(spec_hat, spec_ref)
-
-
-def multi_resolution_stft_loss(
-    recon_audio: torch.Tensor,
-    target_audio: torch.Tensor,
-    resolutions: list[int] = [32, 64, 128, 256, 512, 1024, 2048],
-    window_fn=torch.hann_window,
-    loss_weight: float = 1.0,
-    stem_weights: list[float] = None,
-    hop_divisor: int = 4,
-) -> torch.Tensor:
-    b, c, n, t = recon_audio.shape
-    stem_weights = torch.as_tensor(stem_weights, device=recon_audio.device, dtype=recon_audio.dtype)
-    weight_sum = stem_weights.sum()
-    total_loss = recon_audio.new_tensor(0.0)
-
-    hop_list = [r // hop_divisor for r in resolutions]
-    for stem in range(n):
-        w_stem = stem_weights[stem]
-        for channel in range(c):
-            recon = recon_audio[:, channel, stem].reshape(-1, t)  # (B, T)
-            target = target_audio[:, channel, stem].reshape(-1, t)
-
-            for win_len, hop_length in zip(resolutions, hop_list):
-                window = window_fn(win_len, device=recon.device, dtype=recon.dtype)
-
-                loss_i = torch.utils.checkpoint.checkpoint(
-                    _stft_l1,
-                    recon,
-                    target,
-                    torch.tensor(win_len),
-                    torch.tensor(hop_length),
-                    torch.tensor(win_len),
-                    window,
-                    use_reentrant=False,
-                )
-                total_loss = total_loss + w_stem * loss_i
-    return (total_loss / (c * weight_sum)) * loss_weight
-
-
 def bounded_logits(raw: torch.Tensor, limit: float = 6.0) -> torch.Tensor:
     return limit * torch.tanh(raw / limit)
 
@@ -123,9 +62,6 @@ class TransKun(torch.nn.Module):
         self.fs = conf.fs
         self.num_channels = conf.num_channels
         self.n_fft = self.window_size
-        self.num_stems = 2
-        self.loss_wmse_weight = conf.loss_wmse_weight
-        self.stem_weights = [1.0, 0.3]
 
         self.segmentSizeInSecond = conf.segmentSizeInSecond
         self.segmentHopSizeInSecond = conf.segmentHopSizeInSecond
@@ -165,7 +101,7 @@ class TransKun(torch.nn.Module):
             num_channels=conf.num_channels,
             n_fft=self.n_fft,
             hop_size=conf.hopSize,
-            n_bands=conf.num_bands,
+            n_mels=conf.num_mels,
             hidden_size=conf.baseSize,
             num_heads=conf.nHead,
             ffn_hidden_size_factor=conf.hiddenFactor,
@@ -173,7 +109,6 @@ class TransKun(torch.nn.Module):
             scoring_expansion_factor=conf.scoringExpansionFactor,
             dropout=conf.contextDropoutProb,
             target_midi_pitches=self.target_midi_pitch,
-            band_split_type=conf.band_split_type,
         )
 
     def getDevice(self):
@@ -181,7 +116,7 @@ class TransKun(torch.nn.Module):
 
     def process_frames_batch(self, inputs):
         # inputs: (B, C, N)
-        ctx, recon_audio = self.backbone(inputs)
+        ctx = self.backbone(inputs)
 
         # [ nStep, nStep, nBatch, nSym ]
         S_batch, S_skip_batch = self.scorer(ctx)
@@ -194,40 +129,14 @@ class TransKun(torch.nn.Module):
 
         crf = CRF.NeuralSemiCRFInterval(S_batch, S_skip_batch)
 
-        return crf, ctx, recon_audio
+        return crf, ctx
 
-    def log_prob(self, inputs, notesBatch, target_audio=None):
+    def log_prob(self, inputs, notesBatch):
         B = inputs.shape[0]
         inputs = inputs.transpose(-1, -2)  # [B, C, T]
 
         device = inputs.device
-        # target_audio: [B, T, N, C]
-        if target_audio is not None:
-            target_audio = target_audio.permute(0, 3, 2, 1)  # [B, C, N, T]
-
-        crfBatch, ctxBatch, recon_audio = self.process_frames_batch(inputs)
-
-        loss_spec = torch.tensor(0.0, device=device)
-        loss_wmse = 0.0
-        if target_audio is not None:
-            target_audio = target_audio[..., : recon_audio.shape[-1]]
-
-            loss_spec = multi_resolution_stft_loss(
-                recon_audio=recon_audio,
-                target_audio=target_audio,
-                stem_weights=self.stem_weights,
-                hop_divisor=4,
-            )
-            log_wmse = LogWMSE(
-                audio_length=recon_audio.shape[-1] / self.fs,
-                sample_rate=self.fs,
-                return_as_loss=True,
-            )
-            loss_wmse = log_wmse(
-                inputs,
-                recon_audio,
-                target_audio,
-            )
+        crfBatch, ctxBatch = self.process_frames_batch(inputs)
 
         # prepare groundtruth
         intervalsBatch = []
@@ -308,13 +217,13 @@ class TransKun(torch.nn.Module):
 
         logProb = logProb.view(B, -1)
 
-        return logProb, (loss_spec, loss_wmse, penalty)
+        return logProb, penalty
 
     def compute_stats_mireval(self, inputs, notes_batch):
         B = inputs.shape[0]
         inputs = inputs.transpose(-1, -2)
 
-        notesEstBatch, _, _ = self.transcribeFrames(inputs)
+        notesEstBatch, _ = self.transcribeFrames(inputs)
 
         assert len(notes_batch) == len(notesEstBatch)
 
@@ -354,7 +263,7 @@ class TransKun(torch.nn.Module):
 
         device = inputs.device
 
-        crfBatch, ctxBatch, _ = self.process_frames_batch(inputs)
+        crfBatch, ctxBatch = self.process_frames_batch(inputs)
 
         path = crfBatch.decode()
 
@@ -508,7 +417,7 @@ class TransKun(torch.nn.Module):
     ):
         device = inputs.device
         nBatch = inputs.shape[0]
-        crfBatch, ctxBatch, recon_audio = self.process_frames_batch(inputs)
+        crfBatch, ctxBatch = self.process_frames_batch(inputs)
         nSymbols = len(self.target_midi_pitch)
         n_frames = inputs.shape[1] // self.hop_size + 1
 
@@ -537,11 +446,7 @@ class TransKun(torch.nn.Module):
 
         if nIntervalsAll == 0:
             # nothing detected, return empty
-            return (
-                [[] for _ in range(nBatch)],
-                [0 for _ in range(len(path))],
-                recon_audio,
-            )
+            return ([[] for _ in range(nBatch)], [0 for _ in range(len(path))])
 
         # then predict the attribute set
 
@@ -684,7 +589,7 @@ class TransKun(torch.nn.Module):
 
             notes[idx].sort(key=lambda x: (x.start, x.end, x.pitch))
 
-        return notes, lastP, recon_audio
+        return notes, lastP
 
     def transcribe(
         self,
@@ -715,18 +620,6 @@ class TransKun(torch.nn.Module):
         stepSize = math.ceil(stepInSecond * self.fs / self.hop_size) * self.hop_size
         segmentSize = math.ceil(segmentSizeInSecond * self.fs)
 
-        total_length = x.shape[-1]  # 元波形長 (padding 後)
-        recon_buffer = torch.zeros(
-            self.num_channels,
-            self.num_stems,
-            total_length,
-            device=x.device,
-            dtype=x.dtype,
-        )
-        window_buffer = torch.zeros_like(recon_buffer)  # 窓の重なりを計算するため
-        ola_window = torch.hann_window(segmentSize, device=x.device, dtype=x.dtype)
-        ola_window = ola_window[None, None, :]  # (1, 1, segmentSize)
-
         for i in range(0, nSample, stepSize):
             # t1 = time.time()
 
@@ -750,23 +643,14 @@ class TransKun(torch.nn.Module):
             else:
                 onsetBound = None
 
-            curEvents, lastP, recon_audio = self.transcribeFrames(
+            curEvents, lastP = self.transcribeFrames(
                 curSlice.unsqueeze(0),
                 forcedStartPos=startPos,
                 velocityCriteron="hamming",
                 onsetBound=onsetBound,
                 lastFrameIdx=lastFrameIdx,
             )
-            recon_audio = recon_audio[0]  # (C, N, segmentSize)
             curEvents = curEvents[0]
-
-            # セグメント長と実際の recon_audio 長が違う場合に備えてクロップ
-            seg_len = recon_audio.shape[-1]  # (= segmentSize)
-            end_idx = min(i + seg_len, recon_buffer.shape[-1])
-            valid = end_idx - i  # この区間だけ書き込める
-            win = ola_window[..., :seg_len]
-            recon_buffer[..., i:end_idx] += recon_audio[..., :valid] * win[..., :valid]
-            window_buffer[..., i:end_idx] += win[..., :valid]
 
             startPos = []
             for k in lastP:
@@ -816,12 +700,4 @@ class TransKun(torch.nn.Module):
 
         eventsAll = resolveOverlapping(eventsAll)
 
-        # 窓で割って規格化
-        mask = window_buffer > 0
-        recon_buffer[mask] = recon_buffer[mask] / window_buffer[mask]
-
-        # パディング除去
-        pad_len = math.ceil(padTimeBegin * self.fs)
-        recon_buffer = recon_buffer[..., pad_len:-pad_len]
-
-        return eventsAll, recon_buffer
+        return eventsAll

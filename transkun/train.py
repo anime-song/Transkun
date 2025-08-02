@@ -107,7 +107,6 @@ def train(workerId, filename, runSeed, args):
 
     # this iterator should be constructed each time
     batch_size = args.batch_size
-    loss_spec_weight = conf.loss_spec_weight
 
     if args.hopSize is None:
         hopSize = conf.segmentHopSizeInSecond
@@ -182,13 +181,11 @@ def train(workerId, filename, runSeed, args):
 
             notesBatch = batch["notes"]
             audioSlices = batch["audioSlices"].to(device)
-            target_audio = batch["target_audio"].to(device)
             audioLength = audioSlices.shape[1] / model.conf.fs
 
-            logp, (loss_spec, loss_wmse, penalty) = model.log_prob(audioSlices, notesBatch, target_audio=target_audio)
-            loss_recon = (loss_spec + loss_wmse * model.loss_wmse_weight) * loss_spec_weight
+            logp, penalty = model.log_prob(audioSlices, notesBatch)
             loss_seq = -logp.sum(-1).mean()
-            loss = loss_seq + loss_recon + penalty
+            loss = loss_seq + penalty
 
             (loss / 50).backward()
 
@@ -197,7 +194,7 @@ def train(workerId, filename, runSeed, args):
 
             totalBatch = totalBatch + 1
             totalLen = totalLen + audioLength
-            totalLoss = totalLoss + loss.detach() - loss_recon.detach()
+            totalLoss = totalLoss + loss.detach()
 
             if computeStats:
                 with torch.no_grad():
@@ -235,13 +232,11 @@ def train(workerId, filename, runSeed, args):
             if workerId == 0:
                 t2 = time.time()
                 print(
-                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} log_wmse:{:0.4f} loss_spec:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
+                    "epoch:{} progress:{:0.3f} step:{}  loss:{:0.4f} gradNorm:{:0.2f} clipValue:{:0.2f} time:{:0.2f} ".format(
                         epoc,
                         idx / len(dataloader),
                         globalStep,
                         loss.item(),
-                        loss_wmse.item(),
-                        loss_spec.item(),
                         totalNorm.item(),
                         curClipValue,
                         t2 - t1,
@@ -250,7 +245,6 @@ def train(workerId, filename, runSeed, args):
                 writer.add_scalar(f"Loss/train", loss.item(), globalStep)
                 writer.add_scalar(f"Optimizer/gradNorm", totalNorm.item(), globalStep)
                 writer.add_scalar(f"Optimizer/clipValue", curClipValue, globalStep)
-                writer.add_scalar(f"Loss/train_log_wmse", loss_wmse.item(), globalStep)
                 if computeStats:
                     num_ground_truth = totalGT.item() + 1e-4
                     num_estimated = totalEst.item() + 1e-4
