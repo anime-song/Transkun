@@ -16,3 +16,4 @@ soxr
 moduleconf
 audiomentations
 torch-log-wmse==0.3.0
+pyloudnorm

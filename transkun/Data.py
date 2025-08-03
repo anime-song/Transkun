@@ -12,6 +12,7 @@ import random
 from collections import defaultdict
 import csv
 from typing import Tuple, Optional
+import pyloudnorm as pyln
 
 
 # a local definition of the midi note object
@@ -556,6 +557,20 @@ class AugmentatorAudiomentations:
         return x
 
 
+def loudness_normalize(wav, sr, target_lufs=-14.0):
+    if not np.any(wav):
+        return wav
+
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(wav)
+
+    if not np.isfinite(loudness):
+        return wav
+    gain_db = target_lufs - loudness
+    gain_lin = 10 ** (gain_db / 20)
+    return wav * gain_lin
+
+
 def mix_at_snr(
     signal: np.ndarray,
     noise: np.ndarray,
@@ -607,7 +622,11 @@ def mix_at_snr(
 
     # 合成 & クリップ
     mixture = signal_scaled + noise_scaled
-    mixture = np.clip(mixture, -1.0, 1.0).astype(np.float32)
+    peak = np.max(np.abs(mixture)) + 1e-12
+    if peak > 1.0:
+        mixture /= peak
+        signal_scaled /= peak
+        noise_scaled /= peak
 
     # モノラルなら1Dに戻す
     if mono_input:
@@ -701,8 +720,10 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         mixture = target_audio
         if other_slice is not None:
-            random_snr_db = np.random.uniform(-6.0, 6.0)
-            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_snr_db)
+            random_delta_snr_db = np.random.uniform(-20.0, 12.0)
+            target_audio = loudness_normalize(target_audio, fs)
+            other_slice = loudness_normalize(other_slice, fs)
+            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_delta_snr_db)
             target_audio = np.stack([target_audio, other_audio], axis=-2)  # [T, N, C]
 
         sample = {
