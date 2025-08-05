@@ -10,22 +10,30 @@ import soundfile as sf
 import numpy as np
 
 
-def convert_to_wav(src_path: Path, dst_path: Path, target_sr: int) -> None:
-    """src_path を読み込み、指定 SR で WAV 保存する。
-    モノラル入力の場合はチャンネルを複製してステレオ化する。
+def convert_to_wav(src_path: Path, dst_path: Path, target_sr: int) -> str:
     """
-    # mono=False で多チャンネルをそのまま取得
+    src_path を読み込み、指定 SR で WAV 保存する。
+    モノラル入力の場合はチャンネルを複製してステレオ化する。
+    戻り値: "48000 → 44100 Hz" などの変換ログ文字列
+    """
+    import soundfile as sf  # 上部の import に合わせても OK
+
+    # 変換前 SR を取得
+    original_sr = sf.info(str(src_path)).samplerate
+
+    # mono=False で多チャンネルをそのまま取得（ここで resample）
     audio, _ = librosa.load(str(src_path), sr=target_sr, mono=False)
 
-    # audio.shape: (channels, samples) もしくは (samples,) ←モノラル
     if audio.ndim == 1:  # モノラル → (2, samples) に複製
         audio = np.stack([audio, audio], axis=0)
 
-    # (channels, samples) → (samples, channels) に転置（soundfile 期待形状）
+    # (channels, samples) → (samples, channels)
     audio = audio.T
 
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(dst_path), audio, target_sr)
+
+    return f"{original_sr} → {target_sr} Hz"
 
 
 def process_file(path: Path, target_sr: int, overwrite_wav: bool) -> str:
@@ -33,19 +41,19 @@ def process_file(path: Path, target_sr: int, overwrite_wav: bool) -> str:
     try:
         if ext == ".wav":
             if overwrite_wav:
-                convert_to_wav(path, path, target_sr)
-                return f"Updated WAV → {path}"
+                sr_msg = convert_to_wav(path, path, target_sr)
+                return f"Updated WAV  {sr_msg}  → {path}"
             else:
                 converted = path.with_name(path.stem + "_converted.wav")
-                convert_to_wav(path, converted, target_sr)
-                return f"Created copy → {converted}"
+                sr_msg = convert_to_wav(path, converted, target_sr)
+                return f"Created copy {sr_msg}  → {converted}"
 
         if ext == ".mp3":
             wav_dst = path.with_suffix(".wav")
             if wav_dst.exists() and not overwrite_wav:
                 wav_dst = path.with_name(path.stem + "_from_mp3.wav")
-            convert_to_wav(path, wav_dst, target_sr)
-            return f"MP3 converted → {wav_dst}"
+            sr_msg = convert_to_wav(path, wav_dst, target_sr)
+            return f"MP3 converted {sr_msg}  → {wav_dst}"
 
         return f"Skipped (unsupported) → {path}"
 
@@ -56,8 +64,7 @@ def process_file(path: Path, target_sr: int, overwrite_wav: bool) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively resample WAVs to mono and convert MP3s → WAV. "
-            "Processing is parallelised for speed."
+            "Recursively resample WAVs to mono and convert MP3s → WAV. " "Processing is parallelised for speed."
         )
     )
     parser.add_argument("directory", type=Path, help="検索対象のルートディレクトリ")
