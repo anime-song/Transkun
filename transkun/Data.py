@@ -361,6 +361,7 @@ class DatasetMaestro:
 
         self.sample_offsets: list[int] = []
         self.durations: list[float] = []
+        self.other_exsits: list[bool] = []
 
         # 1 周だけ走査して「オフセット＋duration だけ」収集
         with open(self.datasetAnnotationPicklePath, "rb") as fp:
@@ -373,6 +374,7 @@ class DatasetMaestro:
 
                 self.sample_offsets.append(offset)
                 self.durations.append(float(sample["duration"]))
+                self.other_exsits.append(sample["other_filename"] not in (None, ""))
                 # メモリ節約のため sample は即破棄
 
         print(f"Found {len(self.sample_offsets)} pieces in {os.path.basename(self.datasetAnnotationPicklePath)}")
@@ -482,7 +484,6 @@ class AugmentatorAudiomentations:
             SevenBandParametricEQ,
             PolarityInversion,
             RoomSimulator,
-            Gain,
         )
 
         transformList = [
@@ -494,7 +495,6 @@ class AugmentatorAudiomentations:
                 max_order=3,
                 p=0.5,
             ),
-            Gain(min_gain_db=-6, max_gain_db=0, p=0.5),
         ]
 
         self.transform = Compose(transformList)
@@ -663,6 +663,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
             duration = float(duration)
             chunkSizeInSecond = self.chunkSizeInSecond
             hopSizeInSecond = self.hopSizeInSecond
+            other_exists = self.dataset.other_exsits[idx]
 
             # split the duration into equal size chunks
             # add 1 more for safe guarding the boundary
@@ -683,10 +684,12 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
                 # add empty frames
                 if begin < duration and end > 0:
-                    chunksAll.append((idx, begin, end))
+                    chunksAll.append((idx, begin, end, other_exists))
 
         randGen.shuffle(chunksAll)
         self.chunksAll = chunksAll
+
+        self.chunks_with_other = [c for c in chunksAll if c[3]]
 
     def __len__(self):
         return len(self.chunksAll)
@@ -695,14 +698,14 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         if idx > self.__len__():
             raise IndexError()
 
-        idx, begin, end = self.chunksAll[idx]
+        idx, begin, end, other_exists = self.chunksAll[idx]
 
-        other_idx = None
-        other_end = None
-        other_begin = None
-        if random.random() < 0.5:
-            # ランダムで他の曲のミックスを合成する
-            other_idx, other_begin, other_end = self.chunksAll[random.randint(0, len(self.chunksAll) - 1)]
+        other_idx = other_begin = other_end = None
+        if random.random() < 0.25 or not other_exists:
+            # 「other が存在するチャンク」だけからランダムに 1 つ取得
+            if not self.chunks_with_other:
+                raise RuntimeError("other_exists==True のチャンクが 1 つもありません")
+            other_idx, other_begin, other_end, _ = random.choice(self.chunks_with_other)
 
         notes, target_audio, other_slice, fs = self.dataset.fetchData(
             idx,
@@ -720,7 +723,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         mixture = target_audio
         if other_slice is not None:
-            random_delta_snr_db = np.random.uniform(-20.0, 12.0)
+            random_delta_snr_db = np.random.uniform(-20.0, -6.0)
             target_audio = loudness_normalize(target_audio, fs)
             other_slice = loudness_normalize(other_slice, fs)
             mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_delta_snr_db)
