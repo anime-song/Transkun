@@ -12,6 +12,7 @@ import random
 from collections import defaultdict
 import csv
 from typing import Tuple, Optional
+import pyloudnorm as pyln
 
 
 # a local definition of the midi note object
@@ -360,6 +361,7 @@ class DatasetMaestro:
 
         self.sample_offsets: list[int] = []
         self.durations: list[float] = []
+        self.other_exsits: list[bool] = []
 
         # 1 周だけ走査して「オフセット＋duration だけ」収集
         with open(self.datasetAnnotationPicklePath, "rb") as fp:
@@ -372,6 +374,7 @@ class DatasetMaestro:
 
                 self.sample_offsets.append(offset)
                 self.durations.append(float(sample["duration"]))
+                self.other_exsits.append(sample["other_filename"] not in (None, ""))
                 # メモリ節約のため sample は即破棄
 
         print(f"Found {len(self.sample_offsets)} pieces in {os.path.basename(self.datasetAnnotationPicklePath)}")
@@ -556,6 +559,20 @@ class AugmentatorAudiomentations:
         return x
 
 
+def loudness_normalize(wav, sr, target_lufs=-14.0):
+    if not np.any(wav):
+        return wav
+
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(wav)
+
+    if not np.isfinite(loudness):
+        return wav
+    gain_db = target_lufs - loudness
+    gain_lin = 10 ** (gain_db / 20)
+    return wav * gain_lin
+
+
 def mix_at_snr(
     signal: np.ndarray,
     noise: np.ndarray,
@@ -607,7 +624,11 @@ def mix_at_snr(
 
     # 合成 & クリップ
     mixture = signal_scaled + noise_scaled
-    mixture = np.clip(mixture, -1.0, 1.0).astype(np.float32)
+    peak = np.max(np.abs(mixture)) + 1e-12
+    if peak > 1.0:
+        mixture /= peak
+        signal_scaled /= peak
+        noise_scaled /= peak
 
     # モノラルなら1Dに戻す
     if mono_input:
@@ -644,6 +665,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
             duration = float(duration)
             chunkSizeInSecond = self.chunkSizeInSecond
             hopSizeInSecond = self.hopSizeInSecond
+            other_exists = self.dataset.other_exsits[idx]
 
             # split the duration into equal size chunks
             # add 1 more for safe guarding the boundary
@@ -664,10 +686,11 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
                 # add empty frames
                 if begin < duration and end > 0:
-                    chunksAll.append((idx, begin, end))
+                    chunksAll.append((idx, begin, end, other_exists))
 
         randGen.shuffle(chunksAll)
         self.chunksAll = chunksAll
+        self.chunks_with_other = [c for c in chunksAll if c[3]]
 
     def __len__(self):
         return len(self.chunksAll)
@@ -676,14 +699,14 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         if idx > self.__len__():
             raise IndexError()
 
-        idx, begin, end = self.chunksAll[idx]
+        idx, begin, end, other_exists = self.chunksAll[idx]
 
-        other_idx = None
-        other_end = None
-        other_begin = None
-        if random.random() < 0.5:
-            # ランダムで他の曲のミックスを合成する
-            other_idx, other_begin, other_end = self.chunksAll[random.randint(0, len(self.chunksAll) - 1)]
+        other_idx = other_begin = other_end = None
+        if random.random() < 0.25 or not other_exists:
+            # 「other が存在するチャンク」だけからランダムに 1 つ取得
+            if not self.chunks_with_other:
+                raise RuntimeError("other_exists==True のチャンクが 1 つもありません")
+            other_idx, other_begin, other_end, _ = random.choice(self.chunks_with_other)
 
         notes, target_audio, other_slice, fs = self.dataset.fetchData(
             idx,
@@ -701,8 +724,10 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         mixture = target_audio
         if other_slice is not None:
-            random_snr_db = np.random.uniform(-6.0, 6.0)
-            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_snr_db)
+            random_delta_snr_db = np.random.uniform(-20.0, -6.0)
+            target_audio = loudness_normalize(target_audio, fs)
+            other_slice = loudness_normalize(other_slice, fs)
+            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_delta_snr_db)
             target_audio = np.stack([target_audio, other_audio], axis=-2)  # [T, N, C]
 
         sample = {

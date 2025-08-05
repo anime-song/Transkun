@@ -347,28 +347,28 @@ class Backbone(nn.Module):
             nn.GELU(),
             nn.Conv2d(
                 hidden_size * 2,
-                hidden_size * 2,
+                hidden_size * 4,
                 kernel_size=3,
                 padding=1,
                 stride=(2, 1),
             ),
-            nn.GroupNorm(4, hidden_size * 2),
+            nn.GroupNorm(4, hidden_size * 4),
             nn.GELU(),
             nn.Conv2d(
-                hidden_size * 2,
-                hidden_size * 2,
+                hidden_size * 4,
+                hidden_size * 4,
                 kernel_size=3,
                 padding=1,
                 stride=(2, 1),
             ),
-            nn.GroupNorm(4, hidden_size * 2),
+            nn.GroupNorm(4, hidden_size * 4),
             nn.GELU(),
-            nn.Conv2d(hidden_size * 2, hidden_size * 2, kernel_size=3, padding=1),
-            nn.GroupNorm(4, hidden_size * 2),
+            nn.Conv2d(hidden_size * 4, hidden_size * 4, kernel_size=3, padding=1),
+            nn.GroupNorm(4, hidden_size * 4),
         )
-        self.up_conv = nn.ConvTranspose1d(hidden_size * 2, hidden_size, kernel_size=8, stride=8)
+        self.up_conv = nn.ConvTranspose1d(hidden_size * 4, hidden_size, kernel_size=8, stride=8)
 
-        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size * 2)
+        self.pitch_id_embed = nn.Embedding(self.num_pitches, hidden_size * 4)
         self.register_buffer(
             "pitch_ids",
             torch.arange(self.num_pitches, dtype=torch.long),
@@ -377,8 +377,8 @@ class Backbone(nn.Module):
         self.encoder_layers = nn.ModuleList(
             [
                 BandSplitRoformerLayer(
-                    input_size=hidden_size * 2,
-                    hidden_size=hidden_size * 2,
+                    input_size=hidden_size * 4,
+                    hidden_size=hidden_size * 4,
                     num_heads=num_heads,
                     ffn_hidden_size_factor=ffn_hidden_size_factor,
                     dropout=dropout,
