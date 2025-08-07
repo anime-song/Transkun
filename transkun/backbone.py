@@ -147,7 +147,7 @@ def build_band_indices(sample_rate: int = 44_100, n_fft: int = 2_048) -> Tuple[n
 
 
 class BandSplit(torch.nn.Module):
-    def __init__(self, hidden_size: int, band_indices, num_channels: int):
+    def __init__(self, hidden_size: int, band_indices, num_channels: int, extra_windows: int):
         super().__init__()
         self.hidden_size = hidden_size
         self.band_indices = band_indices
@@ -158,7 +158,7 @@ class BandSplit(torch.nn.Module):
         self.num_bands = len(band_indices)
         self.projections = torch.nn.ModuleList([])
         for i in range(self.num_bands):
-            sub_band_freqs = len(band_indices[i]) * num_channels * 2
+            sub_band_freqs = len(band_indices[i]) * num_channels * 2 * (extra_windows + 1)
             self.projections.append(
                 torch.nn.Sequential(
                     RMSNorm(sub_band_freqs),
@@ -295,6 +295,37 @@ class BandSplitRoformerLayer(nn.Module):
         return x
 
 
+class GaussianWindows(nn.Module):
+    """
+    Learnable set of 1-D Gaussian windows.
+
+    Args:
+        num_windows:  追加ガウス窓の本数
+        window_size:  FFT / STFT ウィンドウ長
+    """
+
+    def __init__(self, num_windows: int, window_size: int) -> None:
+        super().__init__()
+        self.num_windows = num_windows
+        self.window_size = window_size
+
+        self.logit_sigma = nn.Parameter(torch.full((num_windows,), -1.0))
+        mu_init = torch.arange(1, num_windows + 1) / (num_windows + 1)
+        self.logit_mu = nn.Parameter(torch.logit(mu_init))
+
+    def forward(self) -> List[torch.Tensor]:
+        """各ガウス窓 (length = window_size) をリストで返す。"""
+        sigmas = torch.sigmoid(self.logit_sigma)  # (num_windows,)
+        centers = torch.sigmoid(self.logit_mu)  # (num_windows,)
+
+        x = torch.arange(self.window_size, device=self.logit_sigma.device).float()
+        windows = []
+        for sigma, mu in zip(sigmas, centers):
+            exponent = -0.5 * ((x - self.window_size * mu) / (sigma * self.window_size / 2)) ** 2
+            windows.append(torch.exp(exponent))  # shape: (window_size,)
+        return windows
+
+
 class Backbone(nn.Module):
     def __init__(
         self,
@@ -326,6 +357,9 @@ class Backbone(nn.Module):
         self.hop_size = hop_size
         self.num_stems = num_stems
 
+        self.gaussian_windows = GaussianWindows(num_windows=5, window_size=self.window_size)
+        self.register_buffer("hann_window", torch.hann_window(self.window_size))
+
         if band_split_type == "bs":
             _, self.band_indices = build_band_indices(sample_rate=sampling_rate, n_fft=n_fft)
         elif band_split_type == "mel":
@@ -338,6 +372,7 @@ class Backbone(nn.Module):
             hidden_size=hidden_size,
             band_indices=self.band_indices,
             num_channels=self.num_channels,
+            extra_windows=self.gaussian_windows.num_windows,
         )
 
         self.down_conv = nn.Sequential(
@@ -417,21 +452,28 @@ class Backbone(nn.Module):
     def to_spectrogram(self, inputs: torch.Tensor) -> torch.Tensor:
         # (B, C, T)
         inputs = einops.rearrange(inputs, "b c t -> (b c) t")
-        spectrogram = torch.stft(
-            input=inputs,
-            n_fft=self.n_fft,
-            hop_length=self.hop_size,
-            win_length=self.window_size,
-            window=torch.hann_window(self.window_size, device=inputs.device, dtype=inputs.dtype),
-            center=True,
-            return_complex=True,
-        )
-        spectrogram = einops.rearrange(spectrogram, "(b c) f t -> b c f t", c=self.num_channels)
-        spectrogram_complex = spectrogram  # [B, C, F, T]
 
+        windows: list[torch.Tensor] = [self.hann_window]
+        windows.extend(self.gaussian_windows())
+
+        spectrograms = []
+        for win in windows:
+            spectrogram = torch.stft(
+                input=inputs,
+                n_fft=self.n_fft,
+                hop_length=self.hop_size,
+                win_length=self.window_size,
+                window=win.to(inputs.device),
+                center=True,
+                return_complex=True,
+            )
+            spectrogram = einops.rearrange(spectrogram, "(b c) f t -> b c f t", c=self.num_channels)
+            spectrograms.append(spectrogram)  # list of [B, C, F, T]
+
+        spectrogram = torch.concat(spectrograms, dim=1)
         spectrogram = torch.view_as_real(spectrogram)
         spectrogram = einops.rearrange(spectrogram, "b c f t s -> b (c s) t f", s=2)
-        return spectrogram, spectrogram_complex
+        return spectrogram, spectrograms[0]
 
     def to_recon_audio(
         self,
@@ -449,7 +491,7 @@ class Backbone(nn.Module):
             n_fft=self.window_size,
             hop_length=self.hop_size,
             win_length=self.window_size,
-            window=torch.hann_window(self.window_size, device=device, dtype=dtype),
+            window=self.hann_window.to(device),
             center=True,
             return_complex=False,
             length=original_length,
