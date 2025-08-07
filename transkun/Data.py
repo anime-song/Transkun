@@ -11,8 +11,9 @@ import torch
 import random
 from collections import defaultdict
 import csv
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Callable
 import pyloudnorm as pyln
+import multiprocessing as mp
 
 
 # a local definition of the midi note object
@@ -496,7 +497,6 @@ class AugmentatorAudiomentations:
                 max_order=3,
                 p=0.5,
             ),
-            Gain(min_gain_db=-6, max_gain_db=0, p=0.5),
         ]
 
         self.transform = Compose(transformList)
@@ -637,12 +637,59 @@ def mix_at_snr(
         return mixture, signal_scaled, noise_scaled
 
 
+class RandomizedCurriculumSNR:
+    """
+    ・中心値は線形に (max_snr → min_snr) へ遷移
+    ・中心値のまわり ±spread_db(step) の一様分布からサンプリング
+    """
+
+    def __init__(
+        self,
+        min_snr: float = -20.0,
+        max_snr: float = 0.0,
+        max_step: int = 100_000,
+        max_spread: float = 6.0,
+        min_spread: float = 6.0,
+        anneal: str = "linear",
+        rng: random.Random | None = None,
+    ):
+        self.min_snr = min_snr
+        self.max_snr = max_snr
+        self.max_step = max_step
+        self.max_spread = max_spread
+        self.min_spread = min_spread
+
+        if anneal == "linear":
+            self._anneal_fn = lambda r: 1.0 - r  # 1→0
+        elif anneal == "cosine":
+            self._anneal_fn = lambda r: (1 + math.cos(math.pi * r)) / 2
+        elif callable(anneal):
+            self._anneal_fn = anneal
+        else:
+            raise ValueError("anneal must be 'linear', 'cosine', or Callable")
+
+        self.rng = rng if rng is not None else random.Random()
+
+    # --------------------------------------------------------
+    def __call__(self, step: int) -> float:
+        r = min(step / self.max_step, 1.0)  # 0～1
+        center = (1 - r) * self.max_snr + r * self.min_snr
+
+        # spread を徐々に縮める
+        spread_ratio = self._anneal_fn(r)  # 1→0
+        spread = self.min_spread + spread_ratio * (self.max_spread - self.min_spread)
+
+        return center + self.rng.uniform(-spread, +spread)
+
+
 class DatasetMaestroIterator(torch.utils.data.Dataset):
     def __init__(
         self,
         dataset: DatasetMaestro,
         hopSizeInSecond,
         chunkSizeInSecond,
+        step_counter: mp.Value = None,
+        snr_scheduler: Callable[[int], float] = None,
         audioNormalize=True,
         notesStrictlyContained=True,
         ditheringFrames=True,
@@ -650,6 +697,9 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         augmentator=None,
     ):
         super().__init__()
+        self.step_counter = step_counter  # 共有ステップカウンタ
+        self.snr_scheduler = snr_scheduler  # スケジューラ関数
+
         self.dataset = dataset
         self.hopSizeInSecond = hopSizeInSecond
         self.chunkSizeInSecond = chunkSizeInSecond
@@ -695,6 +745,14 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.chunksAll)
 
+    def _current_snr_db(self) -> float:
+        if self.snr_scheduler is None:
+            return 0.0
+
+        with self.step_counter.get_lock():
+            step = self.step_counter.value
+        return self.snr_scheduler(step)
+
     def __getitem__(self, idx):
         if idx > self.__len__():
             raise IndexError()
@@ -724,10 +782,10 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         mixture = target_audio
         if other_slice is not None:
-            random_delta_snr_db = np.random.uniform(-20.0, -6.0)
+            target_snr_db = self._current_snr_db()
             target_audio = loudness_normalize(target_audio, fs)
             other_slice = loudness_normalize(other_slice, fs)
-            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_delta_snr_db)
+            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, target_snr_db)
             target_audio = np.stack([target_audio, other_audio], axis=-2)  # [T, N, C]
 
         sample = {

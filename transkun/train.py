@@ -5,10 +5,12 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 from .model import TransKun
 from . import Data
+from .Data import RandomizedCurriculumSNR
 import copy
 import time
 import numpy as np
 import math
+import multiprocessing as mp
 
 from .train_utils import *
 import argparse
@@ -103,6 +105,8 @@ def train(workerId, filename, runSeed, args):
         writer = SummaryWriter(filename + ".log")
 
     globalStep = startIter
+    global_step = mp.Value("i", startIter)
+    snr_scheduler = RandomizedCurriculumSNR(min_snr=-20.0, max_snr=0.0, max_step=args.nIter, min_spread=6, max_spread=6)
     # create dataloader
 
     # this iterator should be constructed each time
@@ -133,8 +137,10 @@ def train(workerId, filename, runSeed, args):
             dataset,
             hopSize,
             chunkSize,
+            step_counter=global_step,
             seed=epoc * 100 + runSeed,
             augmentator=augmentator,
+            snr_scheduler=snr_scheduler,
             notesStrictlyContained=False,
         )
 
@@ -224,6 +230,8 @@ def train(workerId, filename, runSeed, args):
             gradNormHist.step(totalNorm.item())
 
             optimizer.step()
+            with global_step.get_lock():
+                global_step.value += 1
 
             try:
                 if globalStep > globalStepWarmupCutoff:
