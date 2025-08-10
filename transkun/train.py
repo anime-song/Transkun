@@ -5,12 +5,13 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 from .model import TransKun
 from . import Data
-from .Data import RandomizedCurriculumSNR
+from .Data import RandomizedCurriculumSNR, cosine_scale_skewed
 import copy
 import time
 import numpy as np
 import math
 import multiprocessing as mp
+from functools import partial
 
 from .train_utils import *
 import argparse
@@ -106,7 +107,14 @@ def train(workerId, filename, runSeed, args):
 
     globalStep = startIter
     global_step = mp.Value("i", startIter)
-    snr_scheduler = RandomizedCurriculumSNR(min_snr=-20.0, max_snr=0.0, max_step=args.nIter, min_spread=6, max_spread=6)
+    snr_scheduler = RandomizedCurriculumSNR(
+        min_snr=-20.0,
+        max_snr=0.0,
+        max_step=args.nIter,
+        min_spread=6,
+        max_spread=6,
+        center_anneal=partial(cosine_scale_skewed, gamma=0.5),
+    )
     # create dataloader
 
     # this iterator should be constructed each time
@@ -259,6 +267,7 @@ def train(workerId, filename, runSeed, args):
                 writer.add_scalar(f"Optimizer/gradNorm", totalNorm.item(), globalStep)
                 writer.add_scalar(f"Optimizer/clipValue", curClipValue, globalStep)
                 writer.add_scalar(f"Loss/train_log_wmse", loss_wmse.item(), globalStep)
+                writer.add_scalar(f"Scheduler/center_snr", snr_scheduler.center_at(globalStep), globalStep)
                 if computeStats:
                     num_ground_truth = totalGT.item() + 1e-4
                     num_estimated = totalEst.item() + 1e-4

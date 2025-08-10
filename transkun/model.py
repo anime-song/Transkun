@@ -125,7 +125,7 @@ class TransKun(torch.nn.Module):
         self.n_fft = self.window_size
         self.num_stems = 2
         self.loss_wmse_weight = conf.loss_wmse_weight
-        self.stem_weights = [1.0, 0.3]
+        self.stem_weights = [1.0, 0.0]
 
         self.segmentSizeInSecond = conf.segmentSizeInSecond
         self.segmentHopSizeInSecond = conf.segmentHopSizeInSecond

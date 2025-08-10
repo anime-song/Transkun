@@ -637,48 +637,65 @@ def mix_at_snr(
         return mixture, signal_scaled, noise_scaled
 
 
+def build_anneal_fn(name_or_fn: str | Callable[[float], float]) -> Callable[[float], float]:
+    if callable(name_or_fn):
+        return name_or_fn
+    if name_or_fn == "linear":
+        return lambda ratio: 1.0 - ratio  # 1 → 0
+    if name_or_fn == "cosine":
+        return lambda ratio: (1.0 + math.cos(math.pi * ratio)) / 2.0  # 1 → 0
+    raise ValueError("anneal must be 'linear', 'cosine', or Callable")
+
+
+def cosine_scale_skewed(progress_ratio: float, gamma: float) -> float:
+    progress_ratio = float(np.clip(progress_ratio, 0.0, 1.0))
+    gamma = float(gamma)
+    warped = progress_ratio**gamma
+    return (1.0 + math.cos(math.pi * warped)) / 2.0
+
+
 class RandomizedCurriculumSNR:
     """
-    ・中心値は線形に (max_snr → min_snr) へ遷移
-    ・中心値のまわり ±spread_db(step) の一様分布からサンプリング
+    SNR のカリキュラムスケジューラ。
+    - center: max_snr → min_snr に遷移（center_anneal で形状を指定）
+    - spread: max_spread → min_spread に遷移（spread_anneal で形状を指定）
+    - 各 step で center ± spread の一様分布からサンプリング値を返す
     """
 
     def __init__(
         self,
-        min_snr: float = -20.0,
-        max_snr: float = 0.0,
-        max_step: int = 100_000,
-        max_spread: float = 6.0,
-        min_spread: float = 6.0,
-        anneal: str = "linear",
+        min_snr: float,
+        max_snr: float,
+        max_step: int,
+        min_spread: float,
+        max_spread: float,
+        center_anneal: str | Callable[[float], float] = "linear",
+        spread_anneal: str | Callable[[float], float] = "linear",
         rng: random.Random | None = None,
-    ):
-        self.min_snr = min_snr
-        self.max_snr = max_snr
-        self.max_step = max_step
-        self.max_spread = max_spread
-        self.min_spread = min_spread
-
-        if anneal == "linear":
-            self._anneal_fn = lambda r: 1.0 - r  # 1→0
-        elif anneal == "cosine":
-            self._anneal_fn = lambda r: (1 + math.cos(math.pi * r)) / 2
-        elif callable(anneal):
-            self._anneal_fn = anneal
-        else:
-            raise ValueError("anneal must be 'linear', 'cosine', or Callable")
-
+    ) -> None:
+        self.min_snr = float(min_snr)
+        self.max_snr = float(max_snr)
+        self.max_step = int(max_step)
+        self.min_spread = float(min_spread)
+        self.max_spread = float(max_spread)
+        self._center_anneal_fn = build_anneal_fn(center_anneal)  # 1 → 0
+        self._spread_anneal_fn = build_anneal_fn(spread_anneal)  # 1 → 0
         self.rng = rng if rng is not None else random.Random()
 
-    # --------------------------------------------------------
+    def center_at(self, step: int) -> float:
+        progress_ratio = min(step / self.max_step, 1.0)  # 0～1
+        scale = self._center_anneal_fn(progress_ratio)  # 1 → 0
+        # scale=1 で max_snr、scale=0 で min_snr
+        return self.min_snr + scale * (self.max_snr - self.min_snr)
+
+    def spread_at(self, step: int) -> float:
+        progress_ratio = min(step / self.max_step, 1.0)  # 0～1
+        scale = self._spread_anneal_fn(progress_ratio)  # 1 → 0
+        return self.min_spread + scale * (self.max_spread - self.min_spread)
+
     def __call__(self, step: int) -> float:
-        r = min(step / self.max_step, 1.0)  # 0～1
-        center = (1 - r) * self.max_snr + r * self.min_snr
-
-        # spread を徐々に縮める
-        spread_ratio = self._anneal_fn(r)  # 1→0
-        spread = self.min_spread + spread_ratio * (self.max_spread - self.min_spread)
-
+        center = self.center_at(step)
+        spread = self.spread_at(step)
         return center + self.rng.uniform(-spread, +spread)
 
 
@@ -751,6 +768,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         with self.step_counter.get_lock():
             step = self.step_counter.value
+
         return self.snr_scheduler(step)
 
     def __getitem__(self, idx):
