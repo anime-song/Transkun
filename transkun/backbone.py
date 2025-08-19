@@ -5,10 +5,13 @@ import torch.nn as nn
 import torch.utils.checkpoint
 import librosa
 import einops
-from .utils import checkpointByPass
-from .transformer import TransformerLayer
-
+from .transformer import Transformer, RMSNorm
+from .band_split_roformer import BSRoformer
 from typing import List
+
+
+def checkpoint_bypass(f, *args):
+    return f(*args)
 
 
 class ScaledInnerProductIntervalScorer(nn.Module):
@@ -78,47 +81,6 @@ class ScaledInnerProductIntervalScorer(nn.Module):
         return S, b
 
 
-class BandSplitRoformerLayer(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        num_heads: int,
-        ffn_hidden_size_factor: int = 4,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        self.time_roformer = TransformerLayer(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            ffn_hidden_size_factor=ffn_hidden_size_factor,
-            dropout=dropout,
-        )
-        self.band_roformer = TransformerLayer(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            ffn_hidden_size_factor=ffn_hidden_size_factor,
-            dropout=dropout,
-        )
-
-    def forward(self, x):
-        # x: [B, T, K, F]
-        B, T, K, F = x.shape
-
-        # 時間軸Transformer
-        x = einops.rearrange(x, "b t k f -> (b k) t f")  # [B*K, T, F]
-        x = self.time_roformer(x)
-        x = einops.rearrange(x, "(b k) t f -> b t k f", k=K)  # [B, T, K, F]
-
-        # バンド軸Transformer
-        x = x.reshape(B * T, K, F)  # [B*T, K, F]
-        x = self.band_roformer(x)
-        x = x.reshape(B, T, K, F)
-        return x
-
-
 class GaussianWindows(nn.Module):
     """
     Learnable set of 1-D Gaussian windows.
@@ -151,7 +113,14 @@ class GaussianWindows(nn.Module):
 
 
 class MelSpectrogram(nn.Module):
-    def __init__(self, sampling_rate: int, n_fft: int, hop_length: int, n_mels: int, num_extra_windows: int = 5):
+    def __init__(
+        self,
+        sampling_rate: int,
+        n_fft: int,
+        hop_length: int,
+        n_mels: int,
+        num_extra_windows: int = 5,
+    ):
         super().__init__()
         self.sampling_rate = sampling_rate
         self.n_fft = n_fft
@@ -244,11 +213,27 @@ class Backbone(nn.Module):
         self.sampling_rate = sampling_rate
         self.hop_size = hop_size
 
+        num_stems = 6
+        self.mss_model = BSRoformer(
+            dim=256,
+            num_layers=12,
+            sample_rate=44100,
+            num_channels=2,
+            head_dim=64,
+            num_heads=8,
+            n_fft=2048,
+            hop_length=512,
+            num_stems=num_stems,
+        )
+        self.mss_model.eval()
+        for param in self.mss_model.parameters():
+            param.requires_grad = False
+
         self.mel_spectrogram = MelSpectrogram(
             sampling_rate=sampling_rate, n_fft=n_fft, hop_length=hop_size, n_mels=n_mels
         )
 
-        self.conv1 = nn.Conv2d(self.num_channels * 6, hidden_size, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(self.num_channels * 6 * num_stems, hidden_size, kernel_size=3, padding=1)
 
         self.down_conv = nn.Sequential(
             nn.ConstantPad2d((2, 1, 4, 3), value=0.0),
@@ -283,21 +268,32 @@ class Backbone(nn.Module):
             torch.arange(self.num_pitches, dtype=torch.long),
             persistent=False,
         )
-        self.encoder_layers = nn.ModuleList(
-            [
-                BandSplitRoformerLayer(
-                    input_size=hidden_size * 4,
-                    hidden_size=hidden_size * 4,
-                    num_heads=num_heads,
-                    ffn_hidden_size_factor=ffn_hidden_size_factor,
-                    dropout=dropout,
-                )
-                for _ in range(num_layers)
-            ]
-        )
+        self.layers = nn.ModuleList([])
+        for _ in range(num_layers):
+            time_roformer = Transformer(
+                input_dim=hidden_size * 4,
+                head_dim=hidden_size * 4 // num_heads,
+                num_layers=1,
+                num_heads=num_heads,
+                ffn_hidden_size_factor=ffn_hidden_size_factor,
+                dropout=dropout,
+            )
+            band_roformer = Transformer(
+                input_dim=hidden_size * 4,
+                head_dim=hidden_size * 4 // num_heads,
+                num_layers=1,
+                num_heads=num_heads,
+                ffn_hidden_size_factor=ffn_hidden_size_factor,
+                dropout=dropout,
+            )
+            self.layers.append(nn.ModuleList([time_roformer, band_roformer]))
+        self.final_norm = RMSNorm(hidden_size * 4)
 
         self.up_conv = nn.ConvTranspose1d(
-            hidden_size * 4, hidden_size * scoring_expansion_factor, kernel_size=8, stride=8
+            hidden_size * 4,
+            hidden_size * scoring_expansion_factor,
+            kernel_size=8,
+            stride=8,
         )
 
     def forward(self, x):
@@ -305,7 +301,12 @@ class Backbone(nn.Module):
         if self.use_gradient_checkpoint or self.training:
             checkpoint = torch.utils.checkpoint.checkpoint
         else:
-            checkpoint = checkpointByPass
+            checkpoint = checkpoint_bypass
+
+        # 音源分離
+        with torch.no_grad():
+            stems = self.mss_model(x)  # (B, N, C, T)
+        x = einops.rearrange(stems, "b n c t -> b (n c) t")
 
         x = self.mel_spectrogram(x)  # (B, C, n_mels, T)
         original_time_steps = x.shape[-1]
@@ -316,7 +317,6 @@ class Backbone(nn.Module):
         x = (x - mean) / std
 
         x = self.conv1(x)
-
         # ダウンサンプリング
         x = einops.rearrange(x, "b c f t -> b c t f")
         x = self.down_conv(x)
@@ -327,9 +327,19 @@ class Backbone(nn.Module):
         pitch_query = self.pitch_id_embed(self.pitch_ids)  # [1, 1, E, D]
         pitch_query = pitch_query.expand(B, T, -1, -1)  # [B, T, E, D]
         x = torch.cat([x, pitch_query], dim=2)  # [B, T, K+E, D]
-        for layer in self.encoder_layers:
-            x = checkpoint(layer, x, use_reentrant=False)
+        for time_roformer, band_roformer in self.layers:
+            B, T, K, F = x.shape
+            # 時間軸Transformer
+            x = einops.rearrange(x, "b t k f -> (b k) t f")  # [B*K, T, F]
+            x = checkpoint(time_roformer, x, use_reentrant=False)
+            x = einops.rearrange(x, "(b k) t f -> b t k f", k=K)  # [B, T, K, F]
+
+            # バンド軸Transformer
+            x = x.reshape(B * T, K, F)  # [B*T, K, F]
+            x = checkpoint(band_roformer, x, use_reentrant=False)
+            x = x.reshape(B, T, K, F)
         # x: [B, T, K+E, D]
+        x = self.final_norm(x)
 
         # アップサンプリング
         x = x[:, :, -self.num_pitches :, :]

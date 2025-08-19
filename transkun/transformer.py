@@ -27,13 +27,17 @@ def choose_low_precision_dtype() -> torch.dtype:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, eps: float = 5.960464477539063e-08):  # 0x1p-24
         super().__init__()
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
     def forward(self, x):
-        return F.normalize(x, dim=-1) * self.scale * self.gamma
+        l2_norm = torch.linalg.norm(x, dim=-1, keepdim=True)
+        denom = torch.maximum(l2_norm, torch.full_like(l2_norm, self.eps))
+        normalized_x = x / denom
+        return normalized_x * self.scale * self.gamma
 
 
 class RotaryEmbeddings(torch.nn.Module):
@@ -131,17 +135,52 @@ def apply_rotary_embedding(
     return q_rot, k_rot
 
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads):
+class FeedForward(nn.Module):
+    def __init__(self, dim, ffn_hidden_size_factor=4, dropout=0.0):
         super().__init__()
-        self.hidden_size = hidden_size
+        dim_inner = int(dim * ffn_hidden_size_factor)
+        self.net = nn.Sequential(
+            RMSNorm(dim),
+            nn.Linear(dim, dim_inner),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_inner, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        num_heads=8,
+        head_dim=64,
+        shared_qkv_bias=None,
+        shared_out_bias=None,
+        dropout=0.0,
+    ):
+        super().__init__()
+        self.hidden_size = head_dim * num_heads
         self.num_heads = num_heads
+        self.head_dim = head_dim
 
-        # make sure hiddenSize to be divisible by num_heads
-        self.head_dim = hidden_size // num_heads
+        self.norm = RMSNorm(input_dim)
+        self.to_qkv = nn.Linear(
+            input_dim, self.hidden_size * 3, bias=(shared_qkv_bias is not None)
+        )
+        if shared_qkv_bias is not None:
+            self.to_qkv.bias = shared_qkv_bias
 
-        self.to_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=False)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.to_gates = nn.Linear(input_dim, num_heads)
+        self.to_out = nn.Sequential(
+            nn.Linear(self.hidden_size, input_dim, bias=(shared_out_bias is not None)),
+            nn.Dropout(dropout),
+        )
+        if shared_out_bias is not None:
+            self.to_out[0].bias = shared_out_bias
 
         self.rope = RotaryEmbeddings(
             head_dim=self.head_dim,
@@ -150,6 +189,8 @@ class MultiHeadAttention(nn.Module):
         self.lowp_dtype = choose_low_precision_dtype()
 
     def forward(self, x):
+        x = self.norm(x)
+
         q, k, v = einops.rearrange(
             self.to_qkv(x), "b t (qkv h d) -> qkv b h t d", qkv=3, h=self.num_heads
         )
@@ -169,45 +210,56 @@ class MultiHeadAttention(nn.Module):
         ):
             fetched = F.scaled_dot_product_attention(q, k, v)
 
-        fetched = fetched.float()
-        fetched = einops.rearrange(fetched, "b h t d -> b t (h d)")
-        return self.out_proj(fetched)
+        gates = self.to_gates(x)
+        gates = gates.sigmoid()
+
+        out = fetched.float() * einops.rearrange(gates, "b n h -> b h n 1")
+        out = einops.rearrange(out, "b h t d -> b t (h d)")
+        return self.to_out(out)
 
 
-class TransformerLayer(nn.Module):
+class Transformer(nn.Module):
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int,
+        input_dim: int,
+        head_dim: int,
         num_heads: int,
+        num_layers: int,
         ffn_hidden_size_factor: int = 4,
         dropout: float = 0.0,
+        shared_qkv_bias=None,
+        shared_out_bias=None,
+        output_norm: bool = False,
     ):
         super().__init__()
-        self.attention = MultiHeadAttention(hidden_size, num_heads=num_heads)
-        self.ffn = nn.Sequential(
-            nn.Linear(input_size, hidden_size * ffn_hidden_size_factor),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * ffn_hidden_size_factor, input_size),
-            nn.Dropout(dropout),
-        )
+        self.layers = nn.ModuleList([])
 
-        self.norm_before_attn = RMSNorm(input_size)
-        self.norm_before_ffn = RMSNorm(input_size)
+        for _ in range(num_layers):
+            attention = MultiHeadAttention(
+                input_dim=input_dim,
+                head_dim=head_dim,
+                num_heads=num_heads,
+                shared_qkv_bias=shared_qkv_bias,
+                shared_out_bias=shared_out_bias,
+            )
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        attention,
+                        FeedForward(
+                            dim=input_dim, ffn_hidden_size_factor=ffn_hidden_size_factor
+                        ),
+                    ]
+                )
+            )
 
-        self.out_norm = RMSNorm(input_size)
+        self.norm = RMSNorm(input_dim) if output_norm else nn.Identity()
 
     def forward(self, x):
         # x: [B, T, F]
-        residual = x
-        x = self.norm_before_attn(x)
-        x = self.attention(x)
-        x = x + residual
+        for attention, ffn in self.layers:
+            x = attention(x) + x
+            x = ffn(x) + x
 
-        residual = x
-        x = self.norm_before_ffn(x)
-        x = self.ffn(x)
-        x = x + residual
-        x = self.out_norm(x)
+        x = self.norm(x)
         return x

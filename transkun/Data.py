@@ -11,8 +11,9 @@ import torch
 import random
 from collections import defaultdict
 import csv
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Callable
 import pyloudnorm as pyln
+import multiprocessing as mp
 
 
 # a local definition of the midi note object
@@ -635,12 +636,76 @@ def mix_at_snr(
         return mixture, signal_scaled, noise_scaled
 
 
+def build_anneal_fn(name_or_fn: str | Callable[[float], float]) -> Callable[[float], float]:
+    if callable(name_or_fn):
+        return name_or_fn
+    if name_or_fn == "linear":
+        return lambda ratio: 1.0 - ratio  # 1 → 0
+    if name_or_fn == "cosine":
+        return lambda ratio: (1.0 + math.cos(math.pi * ratio)) / 2.0  # 1 → 0
+    raise ValueError("anneal must be 'linear', 'cosine', or Callable")
+
+
+def cosine_scale_skewed(progress_ratio: float, gamma: float) -> float:
+    progress_ratio = float(np.clip(progress_ratio, 0.0, 1.0))
+    gamma = float(gamma)
+    warped = progress_ratio**gamma
+    return (1.0 + math.cos(math.pi * warped)) / 2.0
+
+
+class RandomizedCurriculumSNR:
+    """
+    SNR のカリキュラムスケジューラ。
+    - center: max_snr → min_snr に遷移（center_anneal で形状を指定）
+    - spread: max_spread → min_spread に遷移（spread_anneal で形状を指定）
+    - 各 step で center ± spread の一様分布からサンプリング値を返す
+    """
+
+    def __init__(
+        self,
+        min_snr: float,
+        max_snr: float,
+        max_step: int,
+        min_spread: float,
+        max_spread: float,
+        center_anneal: str | Callable[[float], float] = "linear",
+        spread_anneal: str | Callable[[float], float] = "linear",
+        rng: random.Random | None = None,
+    ) -> None:
+        self.min_snr = float(min_snr)
+        self.max_snr = float(max_snr)
+        self.max_step = int(max_step)
+        self.min_spread = float(min_spread)
+        self.max_spread = float(max_spread)
+        self._center_anneal_fn = build_anneal_fn(center_anneal)  # 1 → 0
+        self._spread_anneal_fn = build_anneal_fn(spread_anneal)  # 1 → 0
+        self.rng = rng if rng is not None else random.Random()
+
+    def center_at(self, step: int) -> float:
+        progress_ratio = min(step / self.max_step, 1.0)  # 0～1
+        scale = self._center_anneal_fn(progress_ratio)  # 1 → 0
+        # scale=1 で max_snr、scale=0 で min_snr
+        return self.min_snr + scale * (self.max_snr - self.min_snr)
+
+    def spread_at(self, step: int) -> float:
+        progress_ratio = min(step / self.max_step, 1.0)  # 0～1
+        scale = self._spread_anneal_fn(progress_ratio)  # 1 → 0
+        return self.min_spread + scale * (self.max_spread - self.min_spread)
+
+    def __call__(self, step: int) -> float:
+        center = self.center_at(step)
+        spread = self.spread_at(step)
+        return center + self.rng.uniform(-spread, +spread)
+
+
 class DatasetMaestroIterator(torch.utils.data.Dataset):
     def __init__(
         self,
         dataset: DatasetMaestro,
         hopSizeInSecond,
         chunkSizeInSecond,
+        step_counter: mp.Value = None,
+        snr_scheduler: Callable[[int], float] = None,
         audioNormalize=True,
         notesStrictlyContained=True,
         ditheringFrames=True,
@@ -648,6 +713,9 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         augmentator=None,
     ):
         super().__init__()
+        self.step_counter = step_counter  # 共有ステップカウンタ
+        self.snr_scheduler = snr_scheduler  # スケジューラ関数
+
         self.dataset = dataset
         self.hopSizeInSecond = hopSizeInSecond
         self.chunkSizeInSecond = chunkSizeInSecond
@@ -723,10 +791,10 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         mixture = target_audio
         if other_slice is not None:
-            random_delta_snr_db = np.random.uniform(-20.0, -6.0)
+            target_snr_db = np.random.uniform(-18, 6)
             target_audio = loudness_normalize(target_audio, fs)
             other_slice = loudness_normalize(other_slice, fs)
-            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_delta_snr_db)
+            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, target_snr_db)
             target_audio = np.stack([target_audio, other_audio], axis=-2)  # [T, N, C]
 
         sample = {
