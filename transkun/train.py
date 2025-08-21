@@ -86,6 +86,7 @@ def train(workerId, filename, runSeed, args):
         optimizer,
         lrScheduler,
     ) = load_checkpoint(transkun_model, conf, filename, device)
+    model = model.to(device, memory_format=torch.channels_last)
     print("#{} loaded".format(workerId))
 
     if workerId == 0:

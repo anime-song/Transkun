@@ -309,6 +309,7 @@ class Backbone(nn.Module):
         x = einops.rearrange(stems, "b n c t -> b (n c) t")
 
         x = self.mel_spectrogram(x)  # (B, C, n_mels, T)
+        x = x.to(memory_format=torch.channels_last)
         original_time_steps = x.shape[-1]
 
         # 正規化

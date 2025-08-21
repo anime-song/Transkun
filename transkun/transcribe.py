@@ -75,6 +75,7 @@ def main():
         model.load_state_dict(checkpoint["best_state_dict"], strict=False)
 
     model.eval()
+    model = model.to(device, memory_format=torch.channels_last)
 
     audioPath = args.audioPath
     outPath = args.outPath
