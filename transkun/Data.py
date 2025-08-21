@@ -466,6 +466,79 @@ class DatasetMaestro:
         return notes, audioSlice, other_slice, fs
 
 
+from audiomentations.core.transforms_interface import BaseWaveformTransform
+from audiomentations import Limiter
+
+
+class ParallelLinkedLimiterTransform(BaseWaveformTransform):
+    supports_multichannel = True
+    requires_sample_rate = True
+
+    def __init__(
+        self,
+        *,
+        # Limiter のサンプリング範囲（pop_backing向けの安全域）
+        min_threshold_db: float = -12.0,
+        max_threshold_db: float = -8.0,
+        min_attack: float = 0.012,
+        max_attack: float = 0.022,
+        min_release: float = 0.120,
+        max_release: float = 0.220,
+        threshold_mode: str = "relative_to_signal_peak",
+        # パラレルの wet 比率
+        wet_min: float = 0.20,
+        wet_max: float = 0.35,
+        # この変換自体の適用確率
+        p: float = 0.5,
+    ):
+        super().__init__(p)
+        assert min_threshold_db <= max_threshold_db
+        assert min_attack <= max_attack
+        assert min_release <= max_release
+        assert 0.0 <= wet_min <= wet_max <= 1.0
+
+        self.min_threshold_db = float(min_threshold_db)
+        self.max_threshold_db = float(max_threshold_db)
+        self.min_attack = float(min_attack)
+        self.max_attack = float(max_attack)
+        self.min_release = float(min_release)
+        self.max_release = float(max_release)
+        self.threshold_mode = str(threshold_mode)
+
+        self.wet_min = float(wet_min)
+        self.wet_max = float(wet_max)
+
+        self._limiter = Limiter(
+            min_threshold_db=self.min_threshold_db,
+            max_threshold_db=self.max_threshold_db,
+            threshold_mode=self.threshold_mode,
+            min_attack=self.min_attack,
+            max_attack=self.max_attack,
+            min_release=self.min_release,
+            max_release=self.max_release,
+            p=1.0,
+        )
+
+    def randomize_parameters(self, samples: np.ndarray, sample_rate: int):
+        self._limiter.randomize_parameters(samples, sample_rate)
+
+        rng = np.random
+        self.parameters["wet_ratio"] = float(rng.uniform(self.wet_min, self.wet_max))
+
+    def apply(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32, copy=False)
+
+        wet_ratio: float = float(self.parameters["wet_ratio"])
+        dry_ratio: float = 1.0 - wet_ratio
+
+        assert samples.ndim == 2, "Expected (num_channels, num_samples)"
+
+        processed = self._limiter.apply(samples, sample_rate).astype(np.float32)
+        mixed = (dry_ratio * samples + wet_ratio * processed).astype(np.float32)
+        return mixed
+
+
 class AugmentatorAudiomentations:
     def __init__(
         self,
@@ -488,12 +561,24 @@ class AugmentatorAudiomentations:
         )
 
         transformList = [
+            PolarityInversion(p=0.5),
             PitchShift(*pitchShiftRange, p=0.5),
             SevenBandParametricEQ(*eqDBRange, p=0.5),
-            PolarityInversion(p=0.5),
             RoomSimulator(
                 calculation_mode="rt60",
                 max_order=3,
+                p=0.5,
+            ),
+            ParallelLinkedLimiterTransform(
+                min_threshold_db=-12.0,
+                max_threshold_db=-8.0,
+                threshold_mode="relative_to_signal_peak",
+                min_attack=0.012,
+                max_attack=0.020,
+                min_release=0.120,
+                max_release=0.220,
+                wet_min=0.2,
+                wet_max=0.5,
                 p=0.5,
             ),
         ]
