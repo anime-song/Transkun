@@ -11,7 +11,9 @@ import torch
 import random
 from collections import defaultdict
 import csv
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Callable
+import pyloudnorm as pyln
+import multiprocessing as mp
 
 
 # a local definition of the midi note object
@@ -360,6 +362,7 @@ class DatasetMaestro:
 
         self.sample_offsets: list[int] = []
         self.durations: list[float] = []
+        self.other_exsits: list[bool] = []
 
         # 1 周だけ走査して「オフセット＋duration だけ」収集
         with open(self.datasetAnnotationPicklePath, "rb") as fp:
@@ -372,6 +375,7 @@ class DatasetMaestro:
 
                 self.sample_offsets.append(offset)
                 self.durations.append(float(sample["duration"]))
+                self.other_exsits.append(sample["other_filename"] not in (None, ""))
                 # メモリ節約のため sample は即破棄
 
         print(f"Found {len(self.sample_offsets)} pieces in {os.path.basename(self.datasetAnnotationPicklePath)}")
@@ -462,6 +466,79 @@ class DatasetMaestro:
         return notes, audioSlice, other_slice, fs
 
 
+from audiomentations.core.transforms_interface import BaseWaveformTransform
+from audiomentations import Limiter
+
+
+class ParallelLinkedLimiterTransform(BaseWaveformTransform):
+    supports_multichannel = True
+    requires_sample_rate = True
+
+    def __init__(
+        self,
+        *,
+        # Limiter のサンプリング範囲（pop_backing向けの安全域）
+        min_threshold_db: float = -12.0,
+        max_threshold_db: float = -8.0,
+        min_attack: float = 0.012,
+        max_attack: float = 0.022,
+        min_release: float = 0.120,
+        max_release: float = 0.220,
+        threshold_mode: str = "relative_to_signal_peak",
+        # パラレルの wet 比率
+        wet_min: float = 0.20,
+        wet_max: float = 0.35,
+        # この変換自体の適用確率
+        p: float = 0.5,
+    ):
+        super().__init__(p)
+        assert min_threshold_db <= max_threshold_db
+        assert min_attack <= max_attack
+        assert min_release <= max_release
+        assert 0.0 <= wet_min <= wet_max <= 1.0
+
+        self.min_threshold_db = float(min_threshold_db)
+        self.max_threshold_db = float(max_threshold_db)
+        self.min_attack = float(min_attack)
+        self.max_attack = float(max_attack)
+        self.min_release = float(min_release)
+        self.max_release = float(max_release)
+        self.threshold_mode = str(threshold_mode)
+
+        self.wet_min = float(wet_min)
+        self.wet_max = float(wet_max)
+
+        self._limiter = Limiter(
+            min_threshold_db=self.min_threshold_db,
+            max_threshold_db=self.max_threshold_db,
+            threshold_mode=self.threshold_mode,
+            min_attack=self.min_attack,
+            max_attack=self.max_attack,
+            min_release=self.min_release,
+            max_release=self.max_release,
+            p=1.0,
+        )
+
+    def randomize_parameters(self, samples: np.ndarray, sample_rate: int):
+        self._limiter.randomize_parameters(samples, sample_rate)
+
+        rng = np.random
+        self.parameters["wet_ratio"] = float(rng.uniform(self.wet_min, self.wet_max))
+
+    def apply(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32, copy=False)
+
+        wet_ratio: float = float(self.parameters["wet_ratio"])
+        dry_ratio: float = 1.0 - wet_ratio
+
+        assert samples.ndim == 2, "Expected (num_channels, num_samples)"
+
+        processed = self._limiter.apply(samples, sample_rate).astype(np.float32)
+        mixed = (dry_ratio * samples + wet_ratio * processed).astype(np.float32)
+        return mixed
+
+
 class AugmentatorAudiomentations:
     def __init__(
         self,
@@ -481,19 +558,29 @@ class AugmentatorAudiomentations:
             SevenBandParametricEQ,
             PolarityInversion,
             RoomSimulator,
-            Gain,
         )
 
         transformList = [
+            PolarityInversion(p=0.5),
             PitchShift(*pitchShiftRange, p=0.5),
             SevenBandParametricEQ(*eqDBRange, p=0.5),
-            PolarityInversion(p=0.5),
             RoomSimulator(
                 calculation_mode="rt60",
                 max_order=3,
                 p=0.5,
             ),
-            Gain(min_gain_db=-6, max_gain_db=0, p=0.5),
+            ParallelLinkedLimiterTransform(
+                min_threshold_db=-12.0,
+                max_threshold_db=-8.0,
+                threshold_mode="relative_to_signal_peak",
+                min_attack=0.012,
+                max_attack=0.020,
+                min_release=0.120,
+                max_release=0.220,
+                wet_min=0.2,
+                wet_max=0.5,
+                p=0.5,
+            ),
         ]
 
         self.transform = Compose(transformList)
@@ -556,6 +643,20 @@ class AugmentatorAudiomentations:
         return x
 
 
+def loudness_normalize(wav, sr, target_lufs=-14.0):
+    if not np.any(wav):
+        return wav
+
+    meter = pyln.Meter(sr)
+    loudness = meter.integrated_loudness(wav)
+
+    if not np.isfinite(loudness):
+        return wav
+    gain_db = target_lufs - loudness
+    gain_lin = 10 ** (gain_db / 20)
+    return wav * gain_lin
+
+
 def mix_at_snr(
     signal: np.ndarray,
     noise: np.ndarray,
@@ -607,7 +708,11 @@ def mix_at_snr(
 
     # 合成 & クリップ
     mixture = signal_scaled + noise_scaled
-    mixture = np.clip(mixture, -1.0, 1.0).astype(np.float32)
+    peak = np.max(np.abs(mixture)) + 1e-12
+    if peak > 1.0:
+        mixture /= peak
+        signal_scaled /= peak
+        noise_scaled /= peak
 
     # モノラルなら1Dに戻す
     if mono_input:
@@ -616,12 +721,76 @@ def mix_at_snr(
         return mixture, signal_scaled, noise_scaled
 
 
+def build_anneal_fn(name_or_fn: str | Callable[[float], float]) -> Callable[[float], float]:
+    if callable(name_or_fn):
+        return name_or_fn
+    if name_or_fn == "linear":
+        return lambda ratio: 1.0 - ratio  # 1 → 0
+    if name_or_fn == "cosine":
+        return lambda ratio: (1.0 + math.cos(math.pi * ratio)) / 2.0  # 1 → 0
+    raise ValueError("anneal must be 'linear', 'cosine', or Callable")
+
+
+def cosine_scale_skewed(progress_ratio: float, gamma: float) -> float:
+    progress_ratio = float(np.clip(progress_ratio, 0.0, 1.0))
+    gamma = float(gamma)
+    warped = progress_ratio**gamma
+    return (1.0 + math.cos(math.pi * warped)) / 2.0
+
+
+class RandomizedCurriculumSNR:
+    """
+    SNR のカリキュラムスケジューラ。
+    - center: max_snr → min_snr に遷移（center_anneal で形状を指定）
+    - spread: max_spread → min_spread に遷移（spread_anneal で形状を指定）
+    - 各 step で center ± spread の一様分布からサンプリング値を返す
+    """
+
+    def __init__(
+        self,
+        min_snr: float,
+        max_snr: float,
+        max_step: int,
+        min_spread: float,
+        max_spread: float,
+        center_anneal: str | Callable[[float], float] = "linear",
+        spread_anneal: str | Callable[[float], float] = "linear",
+        rng: random.Random | None = None,
+    ) -> None:
+        self.min_snr = float(min_snr)
+        self.max_snr = float(max_snr)
+        self.max_step = int(max_step)
+        self.min_spread = float(min_spread)
+        self.max_spread = float(max_spread)
+        self._center_anneal_fn = build_anneal_fn(center_anneal)  # 1 → 0
+        self._spread_anneal_fn = build_anneal_fn(spread_anneal)  # 1 → 0
+        self.rng = rng if rng is not None else random.Random()
+
+    def center_at(self, step: int) -> float:
+        progress_ratio = min(step / self.max_step, 1.0)  # 0～1
+        scale = self._center_anneal_fn(progress_ratio)  # 1 → 0
+        # scale=1 で max_snr、scale=0 で min_snr
+        return self.min_snr + scale * (self.max_snr - self.min_snr)
+
+    def spread_at(self, step: int) -> float:
+        progress_ratio = min(step / self.max_step, 1.0)  # 0～1
+        scale = self._spread_anneal_fn(progress_ratio)  # 1 → 0
+        return self.min_spread + scale * (self.max_spread - self.min_spread)
+
+    def __call__(self, step: int) -> float:
+        center = self.center_at(step)
+        spread = self.spread_at(step)
+        return center + self.rng.uniform(-spread, +spread)
+
+
 class DatasetMaestroIterator(torch.utils.data.Dataset):
     def __init__(
         self,
         dataset: DatasetMaestro,
         hopSizeInSecond,
         chunkSizeInSecond,
+        step_counter: mp.Value = None,
+        snr_scheduler: Callable[[int], float] = None,
         audioNormalize=True,
         notesStrictlyContained=True,
         ditheringFrames=True,
@@ -629,6 +798,9 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         augmentator=None,
     ):
         super().__init__()
+        self.step_counter = step_counter  # 共有ステップカウンタ
+        self.snr_scheduler = snr_scheduler  # スケジューラ関数
+
         self.dataset = dataset
         self.hopSizeInSecond = hopSizeInSecond
         self.chunkSizeInSecond = chunkSizeInSecond
@@ -644,6 +816,7 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
             duration = float(duration)
             chunkSizeInSecond = self.chunkSizeInSecond
             hopSizeInSecond = self.hopSizeInSecond
+            other_exists = self.dataset.other_exsits[idx]
 
             # split the duration into equal size chunks
             # add 1 more for safe guarding the boundary
@@ -664,10 +837,12 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
                 # add empty frames
                 if begin < duration and end > 0:
-                    chunksAll.append((idx, begin, end))
+                    chunksAll.append((idx, begin, end, other_exists))
 
         randGen.shuffle(chunksAll)
         self.chunksAll = chunksAll
+
+        self.chunks_with_other = [c for c in chunksAll if c[3]]
 
     def __len__(self):
         return len(self.chunksAll)
@@ -676,14 +851,14 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
         if idx > self.__len__():
             raise IndexError()
 
-        idx, begin, end = self.chunksAll[idx]
+        idx, begin, end, other_exists = self.chunksAll[idx]
 
-        other_idx = None
-        other_end = None
-        other_begin = None
-        if random.random() < 0.5:
-            # ランダムで他の曲のミックスを合成する
-            other_idx, other_begin, other_end = self.chunksAll[random.randint(0, len(self.chunksAll) - 1)]
+        other_idx = other_begin = other_end = None
+        if random.random() < 0.25 or not other_exists:
+            # 「other が存在するチャンク」だけからランダムに 1 つ取得
+            if not self.chunks_with_other:
+                raise RuntimeError("other_exists==True のチャンクが 1 つもありません")
+            other_idx, other_begin, other_end, _ = random.choice(self.chunks_with_other)
 
         notes, target_audio, other_slice, fs = self.dataset.fetchData(
             idx,
@@ -701,8 +876,10 @@ class DatasetMaestroIterator(torch.utils.data.Dataset):
 
         mixture = target_audio
         if other_slice is not None:
-            random_snr_db = np.random.uniform(-6.0, 6.0)
-            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, random_snr_db)
+            target_snr_db = np.random.uniform(-18, 6)
+            target_audio = loudness_normalize(target_audio, fs)
+            other_slice = loudness_normalize(other_slice, fs)
+            mixture, target_audio, other_audio = mix_at_snr(target_audio, other_slice, target_snr_db)
             target_audio = np.stack([target_audio, other_audio], axis=-2)  # [T, N, C]
 
         sample = {
